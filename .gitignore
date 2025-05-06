@@ -1,0 +1,45 @@
+# MATLAB and general
+*.asv
+*.m~
+*.mat
+*.fig
+*.mlx
+*.mlapp
+*.log
+*.out
+*.bak
+*.tmp
+*.autosave
+.DS_Store
+Thumbs.db
+
+# Compiled MEX files
+*.mex*
+*.dll
+*.so
+*.dylib
+
+# VS Code and system
+.vscode/
+*.swp
+
+# BPM-Matlab and NLSEMagic build artifacts
+BPM-Matlab/ExampleData/
+BPM-Matlab/src/*.o
+BPM-Matlab/src/*.mex*
+BPM-Matlab/@*/private/*.mex*
+
+# Dataset and results
+mmf_dataset_multi_sign.mat
+phase_sign_*.png
+phase_sign_*.mat
+
+# User/OS specific
+*.user
+*.sublime-workspace
+*.sublime-project
+
+# Jupyter and Python (if any)
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
