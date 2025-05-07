@@ -49,6 +49,30 @@ end
 
 fprintf('Data canonicalization complete. First phase sign forced to positive.\n');
 
+% Step 0.5: Precompute BPMmatlab model and modes ONCE for all image generation
+P = BPMmatlab.model;
+P.name = 'pipeline_main';
+P.useAllCPUs = true;
+P.useGPU = true;
+P.Lx_main = 50e-6;
+P.Ly_main = 50e-6;
+P.Nx_main = 64; % Use dataset image size
+P.Ny_main = 64;
+P.padfactor = 1.5;
+P.dz_target = 1e-6;
+P.lambda = 1000e-9;
+P.n_background = 1.45;
+P.n_0 = 1.46;
+P.Lz = 10e-4;
+P.updates = 1;
+core_radius = 25e-6;
+n_core = P.n_0;
+n_clad = P.n_background;
+P = initializeRIfromFunction(P, @(X,Y,~,~) n_clad + (n_core-n_clad)*(X.^2+Y.^2 < core_radius^2));
+P = findModes(P, numModes, 'plotModes', false);
+
+% Pass P to all mmf_build_image calls in downstream scripts for consistent mode basis
+
 % Step 1a: Train model for absolute amplitudes and phases
 disp('========== STEP 1a: TRAINING MODEL FOR MAGNITUDES PREDICTION ==========');
 options = struct();
