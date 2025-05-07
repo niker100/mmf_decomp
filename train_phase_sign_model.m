@@ -1,7 +1,7 @@
 % filepath: c:\Users\nicks\MATLAB\Projects\MT2_prak\Versuch 3\train_phase_sign_model.m
 % train_phase_sign_model.m - Trains a specialized network for predicting canonical phase signs
 
-function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XValidation, YValidation_amps, YValidation_phases, options)
+function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XValidation, YValidation_amps, YValidation_phases, options, P_precomputed)
     % This function trains a specialized network that focuses only on predicting phase signs
     % where the goal is to maximize correlation between the reconstructed field and the input.
     %
@@ -13,9 +13,13 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
     %   YValidation_amps - Validation amplitude values [samples x modes]
     %   YValidation_phases - Validation phase values [samples x (modes-1)]
     %   options - Struct containing training parameters
+    %   P_precomputed - (Optional) Precomputed BPMmatlab model with modes
     %
     % Output:
     %   dlnet - Trained network for phase sign prediction
+    
+    % Get utility functions
+    utils = mmf_utils();
     
     % Parse options or use defaults
     if nargin < 7
@@ -33,6 +37,8 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
     if ~isfield(options, 'plotProgress'), options.plotProgress = "gui"; end
     if ~isfield(options, 'evaluationFrequency'), options.evaluationFrequency = 200; end
     if ~isfield(options, 'useFixedAmplitudes'), options.useFixedAmplitudes = true; end
+    if ~isfield(options, 'correlationWeight'), options.correlationWeight = 0.6; end
+    if ~isfield(options, 'signLossWeight'), options.signLossWeight = 0.4; end
     
     % Define network parameters from data
     inputSize = [size(XTrain,1) size(XTrain,2)];
@@ -41,6 +47,13 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
     outputSize = number_of_modes - 2; % Only predicting phase signs for modes 3..N
 
     fprintf('Creating phase sign network for %d modes (%d phase signs to predict)...\n', number_of_modes, outputSize);
+    
+    % Get or create BPMmatlab model with precomputed modes
+    if nargin < 8 || isempty(P_precomputed)
+        P = utils.getOrCreateModelWithModes(number_of_modes, inputSize(1), true);
+    else
+        P = P_precomputed;
+    end
     
     % Create network based on specified type
     if strcmpi(options.modelType, "PhaseSignCNN")
@@ -117,14 +130,14 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
             
             % Train with model gradients focused on phase sign prediction
             if strcmpi(options.modelType, "HighModePINN")
-                [gradients, loss, signAccuracy, correlation] = dlfeval(@modelGradients_highModePINN, dlnet, dlX, Y_amps, Y_phases, number_of_modes, options);
+                [gradients, loss, signAccuracy, correlation] = dlfeval(@modelGradients_highModePINN, dlnet, dlX, Y_amps, Y_phases, number_of_modes, options, P, utils);
             else
-                [gradients, loss, signAccuracy, correlation] = dlfeval(@modelGradients_phaseSign, dlnet, dlX, Y_amps, Y_phases, number_of_modes);
+                [gradients, loss, signAccuracy, correlation] = dlfeval(@modelGradients_phaseSign, dlnet, dlX, Y_amps, Y_phases, number_of_modes, options, P, utils);
             end
             
             % Apply gradient clipping
             gradientThreshold = 5e-3;
-            gradients = dlupdate(@(g) thresholdL2Norm(g, gradientThreshold), gradients);
+            gradients = dlupdate(@(g) utils.thresholdL2Norm(g, gradientThreshold), gradients);
             
             % Update weights
             [dlnet, averageGrad, averageSqGrad] = adamupdate(dlnet, gradients, ...
@@ -133,9 +146,9 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
             % Log training progress
             if strcmpi(options.plotProgress, "gui")
                 recordMetrics(monitor, iteration, ...
-                    TotalLoss=extractdata(loss), ...
-                    SignAccuracy=extractdata(signAccuracy), ...
-                    Correlation=extractdata(correlation));
+                    TotalLoss=extract(loss), ...
+                    SignAccuracy=extract(signAccuracy), ...
+                    Correlation=extract(correlation));
                 
                 updateInfo(monitor, Epoch=epoch, LearningRate=options.initialLearnRate);
                 stopTraining = monitor.Stop;
@@ -144,7 +157,7 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
             % Validation check
             if mod(iteration, options.validationFrequency) == 0
                 [validationLoss, valSignAccuracy, valCorrelation] = validatePhaseSignModel(dlnet, XValidation, YValidation_amps, YValidation_phases, ...
-                    options.miniBatchSize, options.executionEnvironment, number_of_modes);
+                    P, options, number_of_modes, utils);
                 
                 % Early stopping check
                 if validationLoss < bestValidationLoss
@@ -168,7 +181,7 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
             
             % Intermediate evaluation
             if options.evaluationFrequency > 0 && mod(iteration, options.evaluationFrequency) == 0
-                performPhaseSignEvaluation(dlnet, XValidation, YValidation_amps, YValidation_phases, number_of_modes);
+                performPhaseSignEvaluation(dlnet, XValidation, YValidation_amps, YValidation_phases, number_of_modes, P, utils);
             end
         end
         
@@ -185,7 +198,7 @@ function dlnet = train_phase_sign_model(XTrain, YTrain_amps, YTrain_phases, XVal
     disp('Phase sign model saved to phase_sign_model.mat');
 end
 
-function [gradients, loss, signAccuracy, correlation] = modelGradients_phaseSign(dlnet, dlX, Y_amps, Y_phases, number_of_modes)
+function [gradients, loss, signAccuracy, correlation] = modelGradients_phaseSign(dlnet, dlX, Y_amps, Y_phases, number_of_modes, options, P, utils)
     % Forward pass to get phase sign predictions
     dlY_pred = forward(dlnet, dlX);
     dlY_pred = real(dlY_pred); % Ensure real values for backprop
@@ -218,11 +231,9 @@ function [gradients, loss, signAccuracy, correlation] = modelGradients_phaseSign
     end
     
     % Calculate sign accuracy - considering all phase signs (canonical form)
-    correct = sum(pred_signs_canonical == true_signs, 'all');
-    total = numel(true_signs);
-    signAccuracy = correct / total;
+    signAccuracy = utils.calculateSignAccuracy(pred_signs_canonical, true_signs);
     
-    % Create complex weights for reconstructions
+    % Create complex weights for reconstructions using utility function
     % True weights from ground truth
     true_weights = zeros(number_of_modes, size(Y_amps, 2), 'like', Y_amps);
     true_weights(1, :) = Y_amps(1, :); % Reference mode (always real)
@@ -249,133 +260,109 @@ function [gradients, loss, signAccuracy, correlation] = modelGradients_phaseSign
         end
     end
 
-    
-    % Build reconstructions using weights
-    %[recon_pred, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), pred_weights', false);
-    %[recon_true, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), true_weights', false);
-    
-    % Calculate correlation between predictions and ground truth reconstructions
-    %correlation = dlCorr(recon_pred, recon_true);
-    
-    % Calculate original image correlation too (helpful for debugging)
-    %input_correlation = dlCorr(recon_true, dlX);
-    
-    % Calculate reconstruction loss - maximize correlation
-    %reconLoss = 1 - correlation;
-    
-        % *** Important: Keep a small contribution from BCE loss to maintain gradient flow ***
-    % Calculate sign prediction loss (binary cross-entropy loss for signs)
-    bce_loss = calculateBCELoss(pred_signs, true_signs(2:end, :));
-    
-    % Weighted loss combination - keep a tiny weight for BCE to maintain tracing
-    correlationWeight = 0.6;
-    signLossWeight = 0.4; % Tiny weight just to maintain tracing
-
-    correlation = zeros(1, 1, 'like', bce_loss);
-    reconLoss = zeros(1, 1, 'like', bce_loss);
-    
-    % Combined loss with small BCE component to maintain tracing
-    loss = correlationWeight * reconLoss + signLossWeight * bce_loss;
-
-    % Calculate gradients
-    gradients = dlgradient(loss, dlnet.Learnables);
-end
-
-function [gradients, loss, signAccuracy, correlation] = modelGradients_highModePINN(dlnet, dlX, Y_amps, Y_phases, number_of_modes, options)
-    % Specialized gradient function for high mode count PINNs with advanced physics constraints
-    % Additional physics-informed constraints include:
-    % 1. Modal dispersion physics with accurate dispersion relations
-    % 2. Phase matching constraints for nonlinear interactions 
-    % 3. Inter-modal energy transfer dynamics
-    % 4. Group velocity effects
-    
-    % Get options or use defaults
-    if nargin < 6
-        options = struct();
-    end
-    
-    % Default weights for different physics components
-    if ~isfield(options, 'correlationWeight'), options.correlationWeight = 0.6; end
-    if ~isfield(options, 'signLossWeight'), options.signLossWeight = 0.4; end
-    if ~isfield(options, 'physicsWeight'), options.physicsWeight = 0.2; end
-    if ~isfield(options, 'dispersionWeight'), options.dispersionWeight = 0.15; end
-    if ~isfield(options, 'modalCouplingWeight'), options.modalCouplingWeight = 0.15; end
-    
-    % Forward pass to get phase sign predictions
-    dlY_pred = forward(dlnet, dlX);
-    dlY_pred = real(dlY_pred); % Ensure real values for backprop
-    
-    Y_amps = Y_amps';
-    Y_phases = Y_phases' * pi;
-
-    % Get ground truth sign values - assume input phases are in canonical form
-    true_signs = sign(Y_phases);
-    
-    % Use tanh activation to constrain predictions to [-1, 1]
-    pred_signs = tanh(dlY_pred);
-    
-    % Convert to binary signs for accuracy calculation
-    pred_signs_binary = sign(pred_signs);
-    
-    % Make sure we have the right number of signs for the canonical form
-    % If we're predicting signs for modes 3..N (N-2 signs), add the +1 sign for mode 2
-    if size(pred_signs_binary, 1) == number_of_modes - 2
-        % First mode (reference) has 0 phase, not included
-        % Second mode's sign is always +1 in canonical form
-        % We're predicting signs for modes 3..N (which is N-2 signs)
-        pred_signs_canonical = [ones(1, size(pred_signs_binary, 2), 'like', pred_signs_binary); 
-                              pred_signs_binary];
-    else
-        % If we're predicting all N-1 signs but working in canonical form,
-        % force the first sign to be +1
-        pred_signs_canonical = pred_signs_binary;
-        pred_signs_canonical(1, :) = ones(1, size(pred_signs_binary, 2), 'like', pred_signs_binary);
-    end
-    
-    % Calculate sign accuracy - considering all phase signs (canonical form)
-    correct = sum(pred_signs_canonical == true_signs, 'all');
-    total = numel(true_signs);
-    signAccuracy = correct / total;
-    
-    % Create complex weights for reconstructions
-    % True weights from ground truth
-    true_weights = zeros(number_of_modes, size(Y_amps, 2), 'like', Y_amps);
-    true_weights(1, :) = Y_amps(1, :); % Reference mode (always real)
-    
-    for m = 2:number_of_modes
-        phase_idx = m - 1;
-        true_weights(m, :) = Y_amps(m, :) .* exp(1i * Y_phases(phase_idx, :));
-    end
-    
-    % Predicted weights using predicted signs with true amplitudes and phase magnitudes
-    pred_weights = zeros(number_of_modes, size(Y_amps, 2), 'like', Y_amps);
-    pred_weights(1, :) = Y_amps(1, :); % Reference mode (always real)
-    
-    for m = 2:number_of_modes
-        phase_idx = m - 1;
-        if phase_idx <= size(pred_signs_canonical, 1)
-            % Use magnitude of true phase with predicted sign
-            phase_magnitude = abs(Y_phases(phase_idx, :));
-            phase_with_sign = pred_signs_canonical(phase_idx, :) .* phase_magnitude;
-            pred_weights(m, :) = Y_amps(m, :) .* exp(1i * phase_with_sign);
-        else
-            % Fallback (should not happen in canonical form)
-            pred_weights(m, :) = Y_amps(m, :) .* exp(1i * Y_phases(phase_idx, :));
-        end
-    end
-
-    % Build reconstructions using weights
-    [recon_pred, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), pred_weights', false);
-    [recon_true, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), true_weights', false);
+    % Build reconstructions using weights and precomputed P
+    [recon_pred, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), pred_weights', false, 0, P);
+    [recon_true, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), true_weights', false, 0, P);
     
     % Calculate correlation between predictions and ground truth reconstructions
-    correlation = dlCorr(recon_pred, recon_true);
+    correlation = utils.dlCorr(recon_pred, recon_true);
     
     % Calculate reconstruction loss - maximize correlation
     reconLoss = 1 - correlation;
     
     % Calculate sign prediction loss (binary cross-entropy loss for signs)
     bce_loss = calculateBCELoss(pred_signs, true_signs(2:end, :));
+    
+    % Weighted loss combination
+    correlationWeight = options.correlationWeight; % Default 0.6
+    signLossWeight = options.signLossWeight;       % Default 0.4
+    
+    % Combined loss
+    loss = correlationWeight * reconLoss + signLossWeight * bce_loss;
+
+    % Calculate gradients
+    gradients = dlgradient(loss, dlnet.Learnables);
+end
+
+function [gradients, loss, signAccuracy, correlation] = modelGradients_highModePINN(dlnet, dlX, Y_amps, Y_phases, number_of_modes, options, P, utils)
+    % Specialized gradient function for high mode count PINNs with advanced physics constraints
+    % Additional physics-informed constraints include:
+    % 1. Modal dispersion physics with accurate dispersion relations
+    % 2. Phase matching constraints for nonlinear interactions 
+    % 3. Inter-modal energy transfer dynamics
+    
+    % Forward pass to get phase sign predictions
+    dlY_pred = forward(dlnet, dlX);
+    dlY_pred = real(dlY_pred); % Ensure real values for backprop
+    
+    Y_amps = Y_amps';
+    Y_phases = Y_phases' * pi;
+
+    % Get ground truth sign values - assume input phases are in canonical form
+    true_signs = sign(Y_phases);
+    
+    % Use tanh activation to constrain predictions to [-1, 1]
+    pred_signs = tanh(dlY_pred);
+    
+    % Convert to binary signs for accuracy calculation
+    pred_signs_binary = sign(pred_signs);
+    
+    % Make sure we have the right number of signs for the canonical form
+    if size(pred_signs_binary, 1) == number_of_modes - 2
+        pred_signs_canonical = [ones(1, size(pred_signs_binary, 2), 'like', pred_signs_binary); 
+                              pred_signs_binary];
+    else
+        pred_signs_canonical = pred_signs_binary;
+        pred_signs_canonical(1, :) = ones(1, size(pred_signs_binary, 2), 'like', pred_signs_binary);
+    end
+    
+    % Calculate sign accuracy - considering all phase signs (canonical form)
+    signAccuracy = utils.calculateSignAccuracy(pred_signs_canonical, true_signs);
+    
+    % Create complex weights for reconstructions
+    % True weights from ground truth
+    true_weights = zeros(number_of_modes, size(Y_amps, 2), 'like', Y_amps);
+    true_weights(1, :) = Y_amps(1, :); % Reference mode (always real)
+    
+    for m = 2:number_of_modes
+        phase_idx = m - 1;
+        true_weights(m, :) = Y_amps(m, :) .* exp(1i * Y_phases(phase_idx, :));
+    end
+    
+    % Predicted weights using predicted signs with true amplitudes and phase magnitudes
+    pred_weights = zeros(number_of_modes, size(Y_amps, 2), 'like', Y_amps);
+    pred_weights(1, :) = Y_amps(1, :); % Reference mode (always real)
+    
+    for m = 2:number_of_modes
+        phase_idx = m - 1;
+        if phase_idx <= size(pred_signs_canonical, 1)
+            % Use magnitude of true phase with predicted sign
+            phase_magnitude = abs(Y_phases(phase_idx, :));
+            phase_with_sign = pred_signs_canonical(phase_idx, :) .* phase_magnitude;
+            pred_weights(m, :) = Y_amps(m, :) .* exp(1i * phase_with_sign);
+        else
+            % Fallback (should not happen in canonical form)
+            pred_weights(m, :) = Y_amps(m, :) .* exp(1i * Y_phases(phase_idx, :));
+        end
+    end
+
+    % Build reconstructions using weights
+    [recon_pred, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), pred_weights', false, 0, P);
+    [recon_true, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), true_weights', false, 0, P);
+    
+    % Calculate correlation between predictions and ground truth reconstructions
+    correlation = utils.dlCorr(recon_pred, recon_true);
+    
+    % Calculate reconstruction loss - maximize correlation
+    reconLoss = 1 - correlation;
+    
+    % Calculate sign prediction loss (binary cross-entropy loss for signs)
+    bce_loss = calculateBCELoss(pred_signs, true_signs(2:end, :));
+    
+    % Get physics weights (or use defaults)
+    if ~isfield(options, 'physicsWeight'), options.physicsWeight = 0.2; end
+    if ~isfield(options, 'dispersionWeight'), options.dispersionWeight = 0.15; end
+    if ~isfield(options, 'modalCouplingWeight'), options.modalCouplingWeight = 0.15; end
     
     % PHYSICS-INFORMED COMPONENTS for high mode count fibers
     % These enhance the network's understanding of physical constraints
@@ -536,36 +523,11 @@ function bce_loss = calculateBCELoss(pred_signs, true_signs)
     bce_loss = bce;
 end
 
-function complex_weights = createComplexWeights(amplitudes, phases, phase_signs, number_of_modes)
-    % Creates complex weights using magnitudes of amplitudes and phases and predicted phase signs
-    % For canonical form:
-    % - amplitudes: [N, batch]
-    % - phases: Contains phase magnitudes for modes 2-N
-    % - phase_signs: Contains signs for modes 2-N, with mode 2's sign always +1 (canonical constraint)
-
-    complex_weights = dlarray(zeros(number_of_modes, size(amplitudes, 2), 'like', amplitudes), 'CB');
-
-    % Reference mode (mode 1) has zero phase
-    complex_weights(1, :) = amplitudes(1, :);
-
-    % For modes 2 to N
-    for m = 2:number_of_modes
-        if m-1 <= size(phases, 1) && m-1 <= size(phase_signs, 1)
-            % Use the magnitude of the phase with the sign
-            phase_magnitude = abs(phases(m-1, :));
-            sign_value = phase_signs(m-1, :);
-
-            % Combine magnitude and sign to get the complex weight
-            complex_weights(m, :) = amplitudes(m, :) .* exp(1i * pi * (phase_magnitude .* sign_value));
-        else
-            % Fallback if phase data is missing (just use amplitude)
-            complex_weights(m, :) = amplitudes(m, :);
-        end
-    end
-end
-
-function [validationLoss, signAccuracy, correlation] = validatePhaseSignModel(dlnet, X, Y_amps, Y_phases, batchSize, executionEnvironment, number_of_modes)
+function [validationLoss, signAccuracy, correlation] = validatePhaseSignModel(dlnet, X, Y_amps, Y_phases, P, options, number_of_modes, utils)
     % Validates the phase sign model on validation data
+    batchSize = options.miniBatchSize;
+    executionEnvironment = options.executionEnvironment;
+    
     numValidation = size(X, 4);
     numBatches = ceil(numValidation/batchSize);
     
@@ -583,11 +545,12 @@ function [validationLoss, signAccuracy, correlation] = validatePhaseSignModel(dl
             dlX = gpuArray(dlX);
         end
         
-        [~, batchLoss, batchAccuracy, batchCorrelation] = dlfeval(@modelGradients_phaseSign, dlnet, dlX, batch_Y_amps, batch_Y_phases, number_of_modes);
+        % Use the same model gradients function for evaluation
+        [~, batchLoss, batchAccuracy, batchCorrelation] = dlfeval(@modelGradients_phaseSign, dlnet, dlX, batch_Y_amps, batch_Y_phases, number_of_modes, options, P, utils);
         
-        totalLoss = totalLoss + extractdata(batchLoss);
-        totalAccuracy = totalAccuracy + extractdata(batchAccuracy);
-        totalCorrelation = totalCorrelation + extractdata(batchCorrelation);
+        totalLoss = totalLoss + extract(batchLoss);
+        totalAccuracy = totalAccuracy + extract(batchAccuracy);
+        totalCorrelation = totalCorrelation + extract(batchCorrelation);
     end
     
     validationLoss = totalLoss / numBatches;
@@ -595,7 +558,7 @@ function [validationLoss, signAccuracy, correlation] = validatePhaseSignModel(dl
     correlation = totalCorrelation / numBatches;
 end
 
-function performPhaseSignEvaluation(dlnet, X_val, Y_amps, Y_phases, number_of_modes)
+function performPhaseSignEvaluation(dlnet, X_val, Y_amps, Y_phases, number_of_modes, P, utils)
     % Evaluate the phase sign model with detailed analysis
     % Select a small subset for visualization
     evalSize = min(8, size(X_val, 4));
@@ -662,8 +625,8 @@ function performPhaseSignEvaluation(dlnet, X_val, Y_amps, Y_phases, number_of_mo
     end
     
     % Build reconstructions - ensure we're using the correct dimensions
-    [recons_true, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, true_weights', false);
-    [recons_pred, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, pred_weights', false);
+    [recons_true, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, true_weights', false, 0, P);
+    [recons_pred, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, pred_weights', false, 0, P);
     
     % Calculate correlations consistently with training approach
     correlations_pred_true = zeros(evalSize, 1); % Correlation between pred and true recon
@@ -830,37 +793,6 @@ function visualizePhaseSignPattern(true_signs, pred_signs, correct_signs)
     ];
     legend(legend_elements, {'Positive Sign', 'Negative Sign', 'Correct', 'Incorrect', 'Canonical (+1)'}, ...
         'Location', 'southoutside', 'Orientation', 'horizontal');
-end
-
-function corr = dlCorr(A, B)
-    % Reshape to 2D while maintaining dlarray format
-    imgSize = size(A, 1) * size(A, 2);
-    batchSize = size(A, 4);
-    
-    % Reshape to [pixels, batch] - crucial to keep as dlarray
-    A_flat = reshape(A, [imgSize, batchSize]);
-    B_flat = reshape(B, [imgSize, batchSize]);
-    
-    % Fast mean calculation along pixel dimension
-    A_mean = mean(A_flat, 1);  
-    B_mean = mean(B_flat, 1);
-    
-    % Center the data (subtract mean)
-    A_centered = A_flat - A_mean;
-    B_centered = B_flat - B_mean;
-    
-    % Compute correlation efficiently
-    % Numerator: covariance
-    numerator = sum(A_centered .* B_centered, 1);
-    
-    % Denominator: product of standard deviations
-    A_std = sqrt(sum(A_centered.^2, 1) + 1e-8);  % Add epsilon for numerical stability
-    B_std = sqrt(sum(B_centered.^2, 1) + 1e-8);
-    denominator = A_std .* B_std;
-    
-    % Compute correlation and average across batch
-    batch_corr = numerator ./ denominator;
-    corr = mean(batch_corr);
 end
 
 % Network architectures for phase sign prediction
