@@ -1,849 +1,498 @@
-function evaluate_full_pipeline(modelFile)
-    % EVALUATE_FULL_PIPELINE - Comprehensive evaluation of the MMF pipeline
-    %
-    % Usage:
-    %   evaluate_full_pipeline() - Evaluates with default phase sign model
-    %   evaluate_full_pipeline('high_mode_pinn_model.mat') - Evaluates with custom model
-    
-    % Handle model file input
-    if nargin < 1
-        phaseModelFile = 'phase_sign_model.mat';
-    else
-        phaseModelFile = modelFile;
-    end
-    
-    % Check if all required models exist
-    if ~exist('amplitude_model.mat', 'file')
-        error('Absolute model not found. Please run train_absolute_model.m first.');
-    end
-    
-    if ~exist(phaseModelFile, 'file')
-        error('Phase sign model not found: %s', phaseModelFile);
-    end
-    
-    if ~exist('phase_sign_classifier.mat', 'file')
-        warning('Global phase sign classifier not found. Skipping global classifier evaluation.');
-        evaluateGlobalClassifier = false;
-    else
-        evaluateGlobalClassifier = true;
-    end
-    
-    % Load dataset
-    fprintf('Loading test dataset...\n');
-    load('mmf_dataset_multi_sign.mat', 'mmf_test', 'labels_test');
-    XTest = mmf_test;
-    YTest = labels_test;
+% filepath: c:\Users\nicks\MATLAB\Projects\MT2_prak\mmf_decomp\evaluate_full_pipeline.m
+% evaluate_full_pipeline.m - Evaluates the full MMF decomposition pipeline
 
-    % Load or create precomputed P (mode basis)
-    persistent P;
-    if isempty(P)
-        P = BPMmatlab.model;
-        P.name = 'pipeline_eval';
-        P.useAllCPUs = true;
-        P.useGPU = true;
-        P.Lx_main = 50e-6;
-        P.Ly_main = 50e-6;
-        P.Nx_main = size(XTest,1);
-        P.Ny_main = size(XTest,2);
-        P.padfactor = 1.5;
-        P.dz_target = 1e-6;
-        P.lambda = 1000e-9;
-        P.n_background = 1.45;
-        P.n_0 = 1.46;
-        P.Lz = 10e-4;
-        P.updates = 1;
-        core_radius = 25e-6;
-        n_core = P.n_0;
-        n_clad = P.n_background;
-        P = initializeRIfromFunction(P, @(X,Y,~,~) n_clad + (n_core-n_clad)*(X.^2+Y.^2 < core_radius^2));
-        P = findModes(P, number_of_modes, 'plotModes', false);
+function evaluate_full_pipeline(mmf_test, labels_test, options, P_precomputed)
+    % EVALUATE_FULL_PIPELINE - Evaluate the complete MMF decomposition pipeline
+    % Evaluates the full pipeline including:
+    % 1. Amplitude and phase magnitude prediction
+    % 2. Phase sign prediction
+    % 3. Global sign flip classification
+    % 4. Full reconstruction quality
+    %
+    % Inputs:
+    %   mmf_test - Test images [height x width x 1 x samples]
+    %   labels_test - Test labels [samples x (2*number_of_modes-1)]
+    %   options - (Optional) Evaluation options struct
+    %   P_precomputed - (Optional) Precomputed BPMmatlab model with modes
+    %
+    % Outputs:
+    %   Display evaluation metrics and plots
+    %   Saves results to 'pipeline_evaluation.mat'
+    
+    % Get utility functions
+    utils = mmf_utils();
+    
+    % Parse options or use defaults
+    if nargin < 3
+        options = struct();
     end
+    
+    % Default options
+    if ~isfield(options, 'showPlots'), options.showPlots = true; end
+    if ~isfield(options, 'batchSize'), options.batchSize = 64; end
+    if ~isfield(options, 'numSamplesToShow'), options.numSamplesToShow = 8; end
+    if ~isfield(options, 'executionEnvironment'), options.executionEnvironment = "gpu"; end
     
     % Load models
-    fprintf('Loading models...\n');
-    load('amplitude_model.mat', 'dlnet_amplitude', 'number_of_modes');
-    load(phaseModelFile, 'dlnet_phase');
-    
-    % Check if using high mode count PINN
-    isHighModeCount = contains(lower(phaseModelFile), 'high_mode');
-    
-    if evaluateGlobalClassifier
-        load('phase_sign_classifier.mat', 'global_classifier');
+    try
+        % Load amplitude and phase model
+        ampModel = load('absolute_model.mat');
+        dlnet_amp = ampModel.dlnet;
+        number_of_modes = ampModel.number_of_modes;
+        
+        % Load phase sign model
+        phaseModel = load('phase_sign_model.mat');
+        dlnet_phase = phaseModel.dlnet;
+        
+        % Load global sign classifier
+        globalModel = load('phase_sign_classifier.mat');
+        global_classifier = globalModel.global_classifier;
+    catch ME
+        error('Failed to load models: %s', ME.message);
     end
     
-    % Determine batch size based on available memory
-    if isHighModeCount
-        batchSize = min(32, size(XTest, 4)); % Smaller batch size for high mode count
+    % Get or create BPMmatlab model with precomputed modes
+    if nargin < 4 || isempty(P_precomputed)
+        inputSize = [size(mmf_test, 1), size(mmf_test, 2)];
+        P = utils.getOrCreateModelWithModes(number_of_modes, inputSize(1), true);
     else
-        batchSize = min(64, size(XTest, 4));
+        P = P_precomputed;
     end
     
-    % Print info
-    fprintf('\n===== MMF Pipeline Evaluation =====\n');
-    fprintf('Number of modes: %d\n', number_of_modes);
-    fprintf('Test samples: %d\n', size(XTest, 4));
-    fprintf('Phase model: %s\n', phaseModelFile);
-    fprintf('Using high mode count model: %s\n', string(isHighModeCount));
-    fprintf('================================\n\n');
+    % Get ground truth
+    amps_true = labels_test(:, 1:number_of_modes);
+    phases_true = labels_test(:, number_of_modes+1:end);
+    signs_true = sign(phases_true);
     
-    % APPROACH 1: Evaluate amplitude model only (with positive phases)
-    fprintf('\nApproach 1: Amplitude model with positive phases\n');
-    [YPred_abs, recon_abs, metrics_abs] = evaluateAbsoluteModel(dlnet_amplitude, XTest, YTest, number_of_modes, batchSize);
+    % Run complete evaluation pipeline
+    [metrics, reconstructions] = evaluatePipeline(mmf_test, amps_true, phases_true, signs_true, ...
+                                dlnet_amp, dlnet_phase, global_classifier, ...
+                                number_of_modes, P, options, utils);
     
-    % APPROACH 2: Evaluate phase sign model
-    fprintf('\nApproach 2: Phase sign model\n');
-    [YPred_phase, recon_phase, metrics_phase] = evaluatePhaseSignModel(dlnet_amplitude, dlnet_phase, XTest, YTest, number_of_modes, batchSize);
-    
-    % APPROACH 3: Evaluate with global classifier (if available)
-    if evaluateGlobalClassifier
-        fprintf('\nApproach 3: Global sign classifier\n');
-        % residuals_test = generateNewResiduals(XTest, YPred_phase, number_of_modes, batchSize);
-        load('residuals.mat', 'residuals_test');
-        [YPred_classifier, recon_classifier, metrics_classifier] = evaluateWithGlobalClassifier(dlnet_amplitude, dlnet_phase, global_classifier, XTest, YTest, residuals_test, number_of_modes, batchSize);
-    else
-        YPred_classifier = [];
-        recon_classifier = [];
-        metrics_classifier = struct();
-    end
-    
-    % Compare all approaches
-    fprintf('\nComparing all approaches...\n');
-    if evaluateGlobalClassifier
-        compareApproaches(XTest, YTest, recon_abs, recon_phase, recon_classifier, metrics_abs, metrics_phase, metrics_classifier, number_of_modes);
-    else
-        compareApproaches(XTest, YTest, recon_abs, recon_phase, [], metrics_abs, metrics_phase, [], number_of_modes);
-    end
+    % Display results
+    displayResults(metrics, reconstructions, options);
     
     % Save results
-    results = struct();
-    results.metrics_abs = metrics_abs;
-    results.metrics_phase = metrics_phase;
-    if evaluateGlobalClassifier
-        results.metrics_classifier = metrics_classifier;
-    end
-    
-    % Use appropriate filename based on model
-    if isHighModeCount
-        outputFile = 'high_mode_evaluation_results.mat';
-    else
-        outputFile = 'evaluation_results.mat';
-    end
-    
-    save(outputFile, 'results');
-    fprintf('Evaluation results saved to %s\n', outputFile);
-    
-    % Show examples
-    visualizeExamples(XTest, YTest, recon_abs, recon_phase, recon_classifier, number_of_modes);
+    save('pipeline_evaluation.mat', 'metrics', 'reconstructions');
+    disp('Pipeline evaluation results saved to pipeline_evaluation.mat');
 end
 
-function [YPred, reconstructed, metrics] = evaluateAbsoluteModel(dlnet, XTest, YTest, number_of_modes, batchSize)
-    fprintf(' - Evaluating model with absolute values only...\n');
+function [metrics, reconstructions] = evaluatePipeline(X_test, amps_true, phases_true, signs_true, ...
+                                dlnet_amp, dlnet_phase, global_classifier, ...
+                                number_of_modes, P, options, utils)
+    % Run all evaluation steps of the pipeline
+    batchSize = options.batchSize;
+    numSamples = size(X_test, 4);
     
-    % Initialize
-    numBatches = ceil(size(XTest, 4) / batchSize);
-    YPred = zeros(size(XTest, 4), 2*number_of_modes - 1);
-    reconstructed = zeros(size(XTest));
-    
-    % Process in batches
-    for b = 1:numBatches
-        batchIdx = ((b-1)*batchSize + 1):min(b*batchSize, size(XTest, 4));
-        
-        % Prepare input
-        dlX = dlarray(XTest(:,:,:,batchIdx), 'SSCB');
-        if canUseGPU()
-            dlX = gpuArray(dlX);
-        end
-        
-        % Get predictions
-        YPred_raw = predict(dlnet, dlX);
-        YPred_raw = extractdata(YPred_raw);
-        
-        % Extract amplitudes and phases
-        amps_pred = YPred_raw(1:number_of_modes, :);
-        phase_abs_pred = YPred_raw(number_of_modes+1:end, :);
-        
-        % ABSOLUTE MODEL APPROACH:
-        % - Use the absolute values of predicted amplitudes (normalized to 0...1)
-        % - Use the absolute values of phases (normalized to 0...1)
-        % - First phase (mode 1) is always zero (reference)
-        
-        % Ensure amplitudes are positive and properly normalized
-        amps_pred = abs(amps_pred);
-        
-        % Use absolute values of phases (convert from -1...1 to 0...1)
-        phase_abs_pred = abs(phase_abs_pred);
-        
-        % Create full phase array with first phase set to zero (reference mode)
-        phase_values = [zeros(1, size(phase_abs_pred, 2)); phase_abs_pred];
-        
-        % Create complex weights with absolute phase values
-        weights = amps_pred .* exp(1i * phase_values * pi);
-        
-        % Reconstruct
-        [recon_batch, ~] = mmf_build_image(number_of_modes, size(XTest,1), length(batchIdx), weights', false, P);
-        
-        % Store results
-        YPred(batchIdx, 1:number_of_modes) = amps_pred';
-        YPred(batchIdx, number_of_modes+1:end) = phase_abs_pred';
-        reconstructed(:,:,:,batchIdx) = recon_batch;
-    end
-    
-    % Calculate metrics
-    metrics = calculateMetrics(XTest, YTest, YPred, reconstructed, number_of_modes);
-    
-    % Report key metrics
-    fprintf('   Mean correlation: %.4f ± %.4f\n', metrics.mean_correlation, metrics.std_correlation);
-    fprintf('   Phase sign accuracy: %.2f%%\n', metrics.phase_sign_accuracy*100);
-    fprintf('   Relative sign accuracy: %.2f%%\n', metrics.relative_sign_accuracy*100);
-end
-
-function [YPred, reconstructed, metrics] = evaluatePhaseSignModel(ampNet, phaseNet, XTest, YTest, number_of_modes, batchSize)
-    fprintf(' - Evaluating dedicated phase sign model...\n');
-    
-    % Initialize
-    numBatches = ceil(size(XTest, 4) / batchSize);
-    YPred = zeros(size(XTest, 4), 2*number_of_modes - 1);
-    reconstructed = zeros(size(XTest));
-    
-    % Process in batches
-    for b = 1:numBatches
-        batchIdx = ((b-1)*batchSize + 1):min(b*batchSize, size(XTest, 4));
-        
-        % Prepare input
-        dlX = dlarray(XTest(:,:,:,batchIdx), 'SSCB');
-        if canUseGPU()
-            dlX = gpuArray(dlX);
-        end
-        
-        % Get amplitude predictions from amplitude model
-        YPred_amps = predict(ampNet, dlX);
-        YPred_amps = extractdata(YPred_amps);
-        
-        % Extract amplitudes and phase magnitudes
-        amps_pred = YPred_amps(1:number_of_modes, :);
-        phase_magnitudes = abs(YPred_amps(number_of_modes+1:end, :));
-        
-        % Get phase sign predictions from phase sign model
-        phase_signs_pred = forward(phaseNet, dlX);
-        phase_signs_pred = extractdata(phase_signs_pred);
-        
-        % Apply tanh and then take sign to convert raw outputs to -1/+1 signs
-        phase_signs = sign(tanh(phase_signs_pred));
-        
-        % CANONICAL FORM HANDLING:
-        % 1. Mode 1 has phase 0 (reference mode)
-        % 2. Mode 2 has phase sign always +1 in canonical form
-        % 3. Modes 3...N have their signs predicted by the network
-        
-        % Check if we're predicting signs for modes 3...N (N-2 signs in total)
-        if size(phase_signs, 1) == number_of_modes - 2
-            % Phase signs model predicts only for modes 3...N
-            % Mode 2's sign is fixed to +1 in canonical form
-            all_signs = [ones(1, size(phase_signs, 2)); phase_signs]; % [1, pred_signs]
-        else
-            % The model predicts all signs, but we enforce canonical constraints
-            all_signs = phase_signs;
-            all_signs(1, :) = ones(1, size(phase_signs, 2)); % Force mode 2 sign to +1
-        end
-        
-        % Apply signs to phase magnitudes
-        phase_values = phase_magnitudes .* all_signs;
-
-        % TEMP: Use ground truth signs for evaluation
-        % phase_values = phase_magnitudes .* sign(YTest(batchIdx, number_of_modes+1:end)');
-        
-        % Complete phase array with 0 for reference mode (mode 1)
-        full_phases = [zeros(1, size(phase_values, 2)); phase_values];
-        
-        % Create complex weights
-        weights = amps_pred .* exp(1i * full_phases * pi);
-        
-        % Reconstruct
-        [recon_batch, ~] = mmf_build_image(number_of_modes, size(XTest,1), length(batchIdx), weights', false, P);
-        
-        % Store results
-        YPred(batchIdx, 1:number_of_modes) = amps_pred';
-        YPred(batchIdx, number_of_modes+1:end) = phase_values';
-        reconstructed(:,:,:,batchIdx) = recon_batch;
-    end
-    
-    % Calculate metrics
-    metrics = calculateMetrics(XTest, YTest, YPred, reconstructed, number_of_modes);
-    
-    % Report key metrics
-    fprintf('   Mean correlation: %.4f ± %.4f\n', metrics.mean_correlation, metrics.std_correlation);
-    fprintf('   Phase sign accuracy: %.2f%%\n', metrics.phase_sign_accuracy*100);
-    fprintf('   Relative sign accuracy: %.2f%%\n', metrics.relative_sign_accuracy*100);
-end
-
-function [YPred, reconstructed, metrics] = evaluateWithGlobalClassifier(ampNet, phaseNet, global_classifier, XTest, YTest, residuals, number_of_modes, batchSize)
-    fprintf(' - Evaluating with global sign classifier...\n');
-    
-    % Initialize
-    numBatches = ceil(size(XTest, 4) / batchSize);
-    YPred = zeros(size(XTest, 4), 2*number_of_modes - 1);
-    reconstructed = zeros(size(XTest));
-    
-    % Process in batches
-    for b = 1:numBatches
-        batchIdx = ((b-1)*batchSize + 1):min(b*batchSize, size(XTest, 4));
-        
-        % Prepare input
-        dlX = dlarray(XTest(:,:,:,batchIdx), 'SSCB');
-        if canUseGPU()
-            dlX = gpuArray(dlX);
-        end
-        
-        % Step 1: Get amplitude predictions from amplitude model
-        YPred_amps = forward(ampNet, dlX);
-        YPred_amps = extractdata(YPred_amps);
-        
-        % Extract amplitudes and phase magnitudes
-        amps_pred = YPred_amps(1:number_of_modes, :);
-        phase_magnitudes = abs(YPred_amps(number_of_modes+1:end, :));
-        
-        % Step 2: Get phase sign predictions from phase sign model
-        phase_signs_pred = forward(phaseNet, dlX);
-        phase_signs_pred = extractdata(phase_signs_pred);
-        
-        % Apply tanh and then take sign to convert raw outputs to -1/+1 signs
-        phase_signs = sign(tanh(phase_signs_pred));
-        
-        % Handle canonical form (identical to evaluatePhaseSignModel)
-        if size(phase_signs, 1) == number_of_modes - 2
-            % Phase signs model predicts only for modes 3...N
-            % Mode 2's sign is fixed to +1 in canonical form
-            all_signs = [ones(1, size(phase_signs, 2)); phase_signs]; % [1, pred_signs]
-        else
-            % The model predicts all signs, but we enforce canonical constraints
-            all_signs = phase_signs;
-            all_signs(1, :) = ones(1, size(phase_signs, 2)); % Force mode 2 sign to +1
-        end
-        
-        % Apply signs to phase magnitudes
-        phase_values = phase_magnitudes .* all_signs;
-
-        
-        YPred(batchIdx, 1:number_of_modes) = amps_pred';
-        YPred(batchIdx, number_of_modes+1:end) = phase_values';
-        
-        % Step 3: Get global sign flip decision from global classifier
-        dlResiduals = generateNewResiduals(dlX, YPred(batchIdx, :), number_of_modes, batchSize);
-        dlResiduals = dlarray(dlResiduals, 'SSCB');
-        global_flip = forward(global_classifier, dlResiduals);
-        global_flip = extractdata(global_flip > 0.5);
-
-        % TEMP: Use ground truth sign for evaluation
-        % global_flip = (sign(YTest(batchIdx, number_of_modes+1)') < 0);
-
-        % Complete phase array with 0 for reference mode
-        full_phases = [zeros(1, size(phase_values, 2)); phase_values];
-        
-        % Apply global flip to all non-reference modes (modes 2...N)
-        for i = 1:size(global_flip, 2)
-            if global_flip(i)
-                % Flip all phases
-                full_phases(:, i) = -full_phases(:, i);
-            end
-        end        
-
-        % Create complex weights
-        weights = amps_pred .* exp(1i * full_phases * pi);
-        
-        % Reconstruct
-        [recon_batch, ~] = mmf_build_image(number_of_modes, size(XTest,1), length(batchIdx), weights', false, P);
-        
-        % Store results
-        YPred(batchIdx, 1:number_of_modes) = amps_pred';
-        YPred(batchIdx, number_of_modes+1:end) = full_phases(2:end, :)';
-        reconstructed(:,:,:,batchIdx) = recon_batch;
-    end
-    
-    % Calculate metrics
-    metrics = calculateMetrics(XTest, YTest, YPred, reconstructed, number_of_modes);
-    
-    % Report key metrics
-    fprintf('   Mean correlation: %.4f ± %.4f\n', metrics.mean_correlation, metrics.std_correlation);
-    fprintf('   Phase sign accuracy: %.2f%%\n', metrics.phase_sign_accuracy*100);
-    fprintf('   Relative sign accuracy: %.2f%%\n', metrics.relative_sign_accuracy*100);
-end
-
-function residuals = generateNewResiduals(XTest, YPred_phase, number_of_modes, batchSize)
-    % Generate residuals as the difference between nonlinear images in XTest and linear reconstructions of phase sign model predictions
-    numSamples = size(XTest, 4);
-    numBatches = ceil(numSamples / batchSize);
-    residuals = zeros(size(XTest));
-    image_size = size(XTest, 1);
-    
-    for b = 1:numBatches
-        batchIdx = ((b-1)*batchSize + 1):min(b*batchSize, numSamples);
-        % --- Nonlinear image from XTest ---
-        nonlinear_img = XTest(:,:,:,batchIdx);
-        % --- Phase sign model prediction reconstruction (linear) ---
-        amps_pred = YPred_phase(batchIdx, 1:number_of_modes)';
-        phases_pred = YPred_phase(batchIdx, number_of_modes+1:end)';
-        phases_pred_full = [zeros(1, size(phases_pred,2)); phases_pred];
-        weights_pred = amps_pred .* exp(1i * phases_pred_full * pi);
-        [recon_pred, ~] = mmf_build_image(number_of_modes, image_size, length(batchIdx), weights_pred, false, P);
-        % --- Residuals ---
-        residuals(:,:,:,batchIdx) = nonlinear_img - recon_pred;
-    end
-end
-
-function metrics = calculateMetrics(XTest, YTest, YPred, reconstructed, number_of_modes)
     % Initialize metrics struct
     metrics = struct();
     
-    % Calculate image correlation
-    num_test = size(XTest, 4);
-    correlations = zeros(num_test, 1);
+    % 1. Evaluate amplitude and phase magnitude model
+    fprintf('Step 1: Evaluating amplitude and phase model...\n');
     
-    for i = 1:num_test
-        correlations(i) = corr2(XTest(:,:,1,i), reconstructed(:,:,1,i));
+    % Initialize arrays for predictions
+    amps_pred = zeros(numSamples, number_of_modes);
+    phase_mags_pred = zeros(numSamples, number_of_modes-1);
+    
+    % Process in batches
+    numBatches = ceil(numSamples/batchSize);
+    for i = 1:numBatches
+        startIdx = (i-1)*batchSize + 1;
+        endIdx = min(i*batchSize, numSamples);
+        
+        % Extract batch data
+        batch_X = X_test(:,:,:,startIdx:endIdx);
+        
+        % Predict amplitudes and phase magnitudes
+        dlX = dlarray(batch_X, 'SSCB');
+        if (options.executionEnvironment == "auto" && utils.canUseGPU()) || options.executionEnvironment == "gpu"
+            dlX = gpuArray(dlX);
+        end
+        
+        % Get amplitude model predictions
+        amp_pred_batch = predict(dlnet_amp, dlX);
+        amp_pred_batch = extractdata(amp_pred_batch);
+        
+        % Separate predictions
+        amps_batch = amp_pred_batch(1:number_of_modes, :)';
+        phase_mags_batch = abs(amp_pred_batch(number_of_modes+1:end, :))';
+        
+        % Store predictions
+        amps_pred(startIdx:endIdx, :) = amps_batch;
+        phase_mags_pred(startIdx:endIdx, :) = phase_mags_batch;
     end
     
-    % Extract amplitudes and phases
-    pred_amplitudes = YPred(:, 1:number_of_modes);
-    true_amplitudes = YTest(:, 1:number_of_modes);
-    pred_phases = YPred(:, number_of_modes+1:end);
-    true_phases = YTest(:, number_of_modes+1:end);
+    % Calculate amplitude metrics
+    amp_mse = mean((amps_pred - amps_true).^2, 'all');
+    amp_rmse = sqrt(amp_mse);
+    amp_mae = mean(abs(amps_pred - amps_true), 'all');
+    amp_rel_error = amp_rmse / mean(abs(amps_true(:)));
     
-    % Calculate amplitude errors
-    amplitude_rmse = sqrt(mean((pred_amplitudes - true_amplitudes).^2, 'all'));
+    % Calculate phase magnitude metrics
+    phase_mag_true = abs(phases_true);
+    phase_mag_mse = mean((phase_mags_pred - phase_mag_true).^2, 'all');
+    phase_mag_rmse = sqrt(phase_mag_mse);
+    phase_mag_mae = mean(abs(phase_mags_pred - phase_mag_true), 'all');
+    phase_mag_rel_error = phase_mag_rmse / mean(phase_mag_true(:));
     
-    % Calculate phase errors
-    phase_error = abs(pred_phases - true_phases);
-    phase_rmse = sqrt(mean(phase_error.^2, 'all'));
+    % Store in metrics
+    metrics.amp_mse = amp_mse;
+    metrics.amp_rmse = amp_rmse;
+    metrics.amp_mae = amp_mae;
+    metrics.amp_rel_error = amp_rel_error;
+    metrics.phase_mag_mse = phase_mag_mse;
+    metrics.phase_mag_rmse = phase_mag_rmse;
+    metrics.phase_mag_mae = phase_mag_mae;
+    metrics.phase_mag_rel_error = phase_mag_rel_error;
     
-    % Calculate phase sign accuracy
-    phase_sign_correct = (sign(pred_phases) == sign(true_phases));
-    phase_sign_accuracy = mean(phase_sign_correct(:));
-    per_mode_sign_accuracy = mean(phase_sign_correct, 1);
+    % 2. Evaluate phase sign model
+    fprintf('Step 2: Evaluating phase sign model...\n');
     
-    % Calculate relative sign accuracy (allowing global ambiguity)
-    [relative_sign_accuracy, per_mode_rel_accuracy] = calculateRelativeSignAccuracy(pred_phases, true_phases);
+    % Initialize arrays for predictions
+    phase_signs_pred = zeros(numSamples, number_of_modes-1);
     
-    % Store results in metrics struct
-    metrics.correlations = correlations;
-    metrics.mean_correlation = mean(correlations);
-    metrics.median_correlation = median(correlations);
-    metrics.std_correlation = std(correlations);
-    metrics.amplitude_rmse = amplitude_rmse;
-    metrics.phase_rmse = phase_rmse;
-    metrics.phase_sign_accuracy = phase_sign_accuracy;
-    metrics.per_mode_sign_accuracy = per_mode_sign_accuracy;
-    metrics.relative_sign_accuracy = relative_sign_accuracy;
-    metrics.per_mode_rel_accuracy = per_mode_rel_accuracy;
-    
-    % Store the predicted and true values for further analysis
-    metrics.pred_amplitudes = pred_amplitudes;
-    metrics.true_amplitudes = true_amplitudes;
-    metrics.pred_phases = pred_phases;
-    metrics.true_phases = true_phases;
-end
-
-function [accuracy, per_mode_accuracy] = calculateRelativeSignAccuracy(pred_phases, true_phases)
-    % Calculate sign accuracy allowing for global phase ambiguity
-    num_samples = size(pred_phases, 1);
-    num_modes = size(pred_phases, 2);
-    
-    % Initialize tracking
-    per_mode_accuracy = zeros(1, num_modes);
-    total_correct = 0;
-    
-    for i = 1:num_samples
-        pred_signs = sign(pred_phases(i, :));
-        true_signs = sign(true_phases(i, :));
+    % Process in batches
+    for i = 1:numBatches
+        startIdx = (i-1)*batchSize + 1;
+        endIdx = min(i*batchSize, numSamples);
         
-        % Compare original vs flipped accuracy
-        match_original = pred_signs == true_signs;
-        match_flipped = -pred_signs == true_signs;
+        % Extract batch data
+        batch_X = X_test(:,:,:,startIdx:endIdx);
         
-        % Determine which has better overall match
-        if sum(match_flipped) > sum(match_original)
-            correct_for_sample = match_flipped;
+        % Predict phase signs
+        dlX = dlarray(batch_X, 'SSCB');
+        if (options.executionEnvironment == "auto" && utils.canUseGPU()) || options.executionEnvironment == "gpu"
+            dlX = gpuArray(dlX);
+        end
+        
+        % Get phase sign model predictions
+        signs_pred_batch = predict(dlnet_phase, dlX);
+        signs_pred_batch = extractdata(sign(tanh(signs_pred_batch)));
+        
+        % Handle canonical form
+        if size(signs_pred_batch, 1) == number_of_modes - 2
+            % Add the positive sign for mode 2
+            all_signs = [ones(1, size(signs_pred_batch, 2)); signs_pred_batch];
         else
-            correct_for_sample = match_original;
+            all_signs = signs_pred_batch;
+            all_signs(1, :) = 1; % Force canonical form
         end
         
-        % Update counters
-        per_mode_accuracy = per_mode_accuracy + correct_for_sample;
-        total_correct = total_correct + sum(correct_for_sample);
+        % Store predictions
+        phase_signs_pred(startIdx:endIdx, :) = all_signs';
     end
     
-    % Normalize
-    per_mode_accuracy = per_mode_accuracy / num_samples;
-    accuracy = total_correct / (num_samples * num_modes);
+    % Calculate sign accuracy per mode
+    sign_matches = (phase_signs_pred == signs_true);
+    mode_sign_accuracy = mean(sign_matches, 1);
+    overall_sign_accuracy = mean(sign_matches, 'all');
+    
+    % Calculate weighted accuracy (weighting by phase magnitude)
+    weighted_matches = sign_matches .* phase_mag_true;
+    weighted_sign_accuracy = sum(weighted_matches(:)) / sum(phase_mag_true(:));
+    
+    % Store in metrics
+    metrics.mode_sign_accuracy = mode_sign_accuracy;
+    metrics.overall_sign_accuracy = overall_sign_accuracy;
+    metrics.weighted_sign_accuracy = weighted_sign_accuracy;
+    
+    % 3. Evaluate global sign classifier
+    fprintf('Step 3: Evaluating global sign classifier...\n');
+    
+    % Generate residuals from current (potentially wrong) predictions
+    residuals = generateResiduals(X_test, amps_pred, phase_mags_pred, phase_signs_pred, number_of_modes, P, batchSize, utils);
+    
+    % Initialize arrays for predictions
+    global_flip_pred = zeros(numSamples, 1);
+    
+    % Process in batches for memory efficiency
+    for i = 1:numBatches
+        startIdx = (i-1)*batchSize + 1;
+        endIdx = min(i*batchSize, numSamples);
+        
+        % Extract batch residuals
+        batch_res = residuals(:,:,:,startIdx:endIdx);
+        
+        % Predict global sign flip
+        dlX = dlarray(batch_res, 'SSCB');
+        if (options.executionEnvironment == "auto" && utils.canUseGPU()) || options.executionEnvironment == "gpu"
+            dlX = gpuArray(dlX);
+        end
+        
+        % Get global flip predictions (0=keep, 1=flip)
+        flip_pred_batch = predict(global_classifier, dlX);
+        flip_pred_batch = extractdata(flip_pred_batch > 0.5);
+        
+        % Store predictions
+        global_flip_pred(startIdx:endIdx) = flip_pred_batch;
+    end
+    
+    % Apply global sign flips to get final signs
+    final_signs_pred = phase_signs_pred;
+    for i = 1:numSamples
+        if global_flip_pred(i)
+            final_signs_pred(i,:) = -phase_signs_pred(i,:);
+        end
+    end
+    
+    % Calculate final sign accuracy
+    final_sign_matches = (final_signs_pred == signs_true);
+    final_mode_sign_accuracy = mean(final_sign_matches, 1);
+    final_overall_sign_accuracy = mean(final_sign_matches, 'all');
+    
+    % Calculate weighted accuracy
+    final_weighted_matches = final_sign_matches .* phase_mag_true;
+    final_weighted_sign_accuracy = sum(final_weighted_matches(:)) / sum(phase_mag_true(:));
+    
+    % Calculate improvement from global classifier
+    sign_accuracy_improvement = final_overall_sign_accuracy - overall_sign_accuracy;
+    weighted_accuracy_improvement = final_weighted_sign_accuracy - weighted_sign_accuracy;
+    
+    % Store in metrics
+    metrics.global_sign_accuracy = mean(global_flip_pred == getGroundTruthFlips(phase_signs_pred, signs_true));
+    metrics.final_mode_sign_accuracy = final_mode_sign_accuracy;
+    metrics.final_overall_sign_accuracy = final_overall_sign_accuracy;
+    metrics.final_weighted_sign_accuracy = final_weighted_sign_accuracy;
+    metrics.sign_accuracy_improvement = sign_accuracy_improvement;
+    metrics.weighted_accuracy_improvement = weighted_accuracy_improvement;
+    
+    % 4. Generate and evaluate final reconstructions
+    fprintf('Step 4: Evaluating final reconstructions...\n');
+    
+    % Create complex weights from final predictions
+    final_phases_pred = phase_mags_pred .* final_signs_pred;
+    weights_pred = utils.createComplexWeights(amps_pred, final_phases_pred);
+    weights_true = utils.createComplexWeights(amps_true, phases_true);
+    
+    % Create ground truth reconstructions once
+    image_size = size(X_test, 1);
+    recons_true = zeros(size(X_test), 'like', X_test);
+    
+    % Generate ground truth reconstructions in batches
+    for i = 1:numBatches
+        startIdx = (i-1)*batchSize + 1;
+        endIdx = min(i*batchSize, numSamples);
+        
+        % Extract batch weights
+        batch_weights_true = weights_true(startIdx:endIdx, :);
+        
+        % Build reconstruction
+        [recon_true_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights_true, false, 0, P);
+        
+        % Store reconstructions
+        recons_true(:,:,:,startIdx:endIdx) = recon_true_batch;
+    end
+    
+    % Generate predicted reconstructions in batches
+    recons_pred = zeros(size(X_test), 'like', X_test);
+    correlations = zeros(numSamples, 1);
+    
+    for i = 1:numBatches
+        startIdx = (i-1)*batchSize + 1;
+        endIdx = min(i*batchSize, numSamples);
+        
+        % Extract batch weights
+        batch_weights_pred = weights_pred(startIdx:endIdx, :);
+        
+        % Build reconstruction
+        [recon_pred_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights_pred, false, 0, P);
+        
+        % Store reconstructions
+        recons_pred(:,:,:,startIdx:endIdx) = recon_pred_batch;
+        
+        % Calculate correlations with original images
+        for j = startIdx:endIdx
+            correlations(j) = corr2(extract(X_test(:,:,:,j)), extract(recon_pred_batch(:,:,:,j-startIdx+1)));
+        end
+    end
+    
+    % Calculate reconstruction metrics
+    recon_mse = mean((recons_pred - X_test).^2, 'all');
+    recon_rmse = sqrt(recon_mse);
+    recon_corr = mean(correlations);
+    
+    % Calculate relative improvement over ground truth reconstruction
+    gt_mse = mean((recons_true - X_test).^2, 'all');
+    gt_rmse = sqrt(gt_mse);
+    gt_correlations = zeros(numSamples, 1);
+    
+    for i = 1:numSamples
+        gt_correlations(i) = corr2(extract(X_test(:,:,:,i)), extract(recons_true(:,:,:,i)));
+    end
+    gt_corr = mean(gt_correlations);
+    
+    recon_rel_error = recon_rmse / mean(abs(X_test(:)));
+    gt_rel_error = gt_rmse / mean(abs(X_test(:)));
+    
+    % Store reconstruction metrics
+    metrics.recon_mse = recon_mse;
+    metrics.recon_rmse = recon_rmse;
+    metrics.recon_corr = recon_corr;
+    metrics.gt_mse = gt_mse;
+    metrics.gt_rmse = gt_rmse;
+    metrics.gt_corr = gt_corr;
+    metrics.recon_rel_error = recon_rel_error;
+    metrics.gt_rel_error = gt_rel_error;
+    
+    % Store reconstructions for a subset of samples
+    n_samples = min(options.numSamplesToShow, numSamples);
+    sample_indices = randperm(numSamples, n_samples);
+    
+    reconstructions = struct();
+    reconstructions.indices = sample_indices;
+    reconstructions.original = X_test(:,:,:,sample_indices);
+    reconstructions.predicted = recons_pred(:,:,:,sample_indices);
+    reconstructions.ground_truth = recons_true(:,:,:,sample_indices);
+    reconstructions.correlations = correlations(sample_indices);
+    reconstructions.gt_correlations = gt_correlations(sample_indices);
 end
 
-function compareApproaches(XTest, YTest, recon_abs, recon_phase, recon_classifier, metrics_abs, metrics_phase, metrics_classifier, number_of_modes)
-    % Create comparison figure
-    figure('Name', 'Pipeline Comparison', 'Position', [100, 100, 1200, 800]);
+function residuals = generateResiduals(X, amps_pred, phase_mags_pred, phase_signs_pred, number_of_modes, P, batchSize, utils)
+    % Generate residuals for global sign classifier
+    numSamples = size(X, 4);
+    image_size = size(X, 1);
     
-    % 1. Correlation comparison
-    subplot(2, 3, 1);
-    if ~isempty(metrics_classifier)
-        boxplot([metrics_abs.correlations, metrics_phase.correlations, metrics_classifier.correlations], ...
-            'Labels', {'Abs Only', 'Phase Model', 'Global Classifier'});
-        colors = {'r', 'g', 'b'};
-    else
-        boxplot([metrics_abs.correlations, metrics_phase.correlations], ...
-            'Labels', {'Abs Only', 'Phase Model'});
-        colors = {'r', 'g'};
-    end
+    % Initialize residuals
+    residuals = zeros(size(X), 'like', X);
     
-    % Apply box colors
-    h = findobj(gca, 'Tag', 'Box');
-    for j = 1:length(h)
-        patch(get(h(j), 'XData'), get(h(j), 'YData'), colors{j}, 'FaceAlpha', 0.5);
-    end
+    % Create complex weights
+    phases_pred = phase_mags_pred .* phase_signs_pred;
+    weights_pred = utils.createComplexWeights(amps_pred, phases_pred);
     
-    title('Image Correlation');
-    ylabel('Correlation');
-    grid on;
+    % Generate reconstructions in batches
+    numBatches = ceil(numSamples/batchSize);
     
-    % 2. Phase sign accuracy by mode
-    subplot(2, 3, 2);
-    hold on;
-    
-    % Collect data for bar chart
-    bar_data = [metrics_abs.per_mode_sign_accuracy' * 100, ...
-               metrics_phase.per_mode_sign_accuracy' * 100];
-    
-    if ~isempty(metrics_classifier)
-        bar_data = [bar_data, metrics_classifier.per_mode_sign_accuracy' * 100];
-    end
-    
-    bar(bar_data);
-    
-    title('Phase Sign Accuracy by Mode');
-    xlabel('Mode');
-    ylabel('Accuracy (%)');
-    
-    if ~isempty(metrics_classifier)
-        legend({'Abs Only', 'Phase Model', 'Global Classifier'}, 'Location', 'best');
-    else
-        legend({'Abs Only', 'Phase Model'}, 'Location', 'best');
-    end
-    
-    ylim([0 100]);
-    grid on;
-    hold off;
-    
-    % 3. Relative improvement
-    subplot(2, 3, 3);
-    
-    % Define metrics to compare
-    metrics_labels = {'Correlation', 'Amp RMSE', 'Phase RMSE', 'Sign Acc.', 'Rel. Sign Acc.'};
-    
-    % Collect absolute metrics
-    abs_values = [metrics_abs.mean_correlation, ...
-                 metrics_abs.amplitude_rmse, ...
-                 metrics_abs.phase_rmse, ...
-                 metrics_abs.phase_sign_accuracy, ...
-                 metrics_abs.relative_sign_accuracy];
-    
-    % Calculate improvement from phase sign model
-    phase_values = [metrics_phase.mean_correlation, ...
-                   metrics_phase.amplitude_rmse, ...
-                   metrics_phase.phase_rmse, ...
-                   metrics_phase.phase_sign_accuracy, ...
-                   metrics_phase.relative_sign_accuracy];
-    
-    % Calculate relative improvement - handle different directions
-    phase_improvement = zeros(1, 5);
-    
-    % For correlation and accuracies - higher is better
-    phase_improvement(1) = (phase_values(1) - abs_values(1)) / abs(abs_values(1)) * 100;
-    phase_improvement(4) = (phase_values(4) - abs_values(4)) / abs(abs_values(4)) * 100;
-    phase_improvement(5) = (phase_values(5) - abs_values(5)) / abs(abs_values(5)) * 100;
-    
-    % For error metrics - lower is better
-    phase_improvement(2) = -(phase_values(2) - abs_values(2)) / abs(abs_values(2)) * 100;
-    phase_improvement(3) = -(phase_values(3) - abs_values(3)) / abs(abs_values(3)) * 100;
-    
-    % Add classifier improvement if available
-    if ~isempty(metrics_classifier)
-        classifier_values = [metrics_classifier.mean_correlation, ...
-                            metrics_classifier.amplitude_rmse, ...
-                            metrics_classifier.phase_rmse, ...
-                            metrics_classifier.phase_sign_accuracy, ...
-                            metrics_classifier.relative_sign_accuracy];
+    for i = 1:numBatches
+        startIdx = (i-1)*batchSize + 1;
+        endIdx = min(i*batchSize, numSamples);
         
-        classifier_improvement = zeros(1, 5);
+        % Extract batch weights
+        batch_weights = weights_pred(startIdx:endIdx, :);
         
-        % Same logic as above
-        classifier_improvement(1) = (classifier_values(1) - abs_values(1)) / abs(abs_values(1)) * 100;
-        classifier_improvement(4) = (classifier_values(4) - abs_values(4)) / abs(abs_values(4)) * 100;
-        classifier_improvement(5) = (classifier_values(5) - abs_values(5)) / abs(abs_values(5)) * 100;
+        % Build reconstruction
+        [recon_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights, false, 0, P);
         
-        classifier_improvement(2) = -(classifier_values(2) - abs_values(2)) / abs(abs_values(2)) * 100;
-        classifier_improvement(3) = -(classifier_values(3) - abs_values(3)) / abs(abs_values(3)) * 100;
-        
-        % Plot both improvements
-        bar([phase_improvement; classifier_improvement]');
-        legend({'Phase Model', 'Global Classifier'});
-    else
-        % Plot only phase model improvement
-        bar(phase_improvement);
-        legend({'Phase Model'});
+        % Calculate residuals
+        residuals(:,:,:,startIdx:endIdx) = X(:,:,:,startIdx:endIdx) - recon_batch;
     end
-    
-    title('Improvement over Absolute Model (%)');
-    xticklabels(metrics_labels);
-    ylabel('Improvement (%)');
-    grid on;
-    
-    % Add text annotations for improvements
-    if ~isempty(metrics_classifier)
-        for i = 1:length(phase_improvement)
-            text(i-0.15, phase_improvement(i) + sign(phase_improvement(i))*3, ...
-                sprintf('%+.1f%%', phase_improvement(i)), ...
-                'HorizontalAlignment', 'center', 'FontWeight', 'bold', 'FontSize', 8);
-            
-            text(i+0.15, classifier_improvement(i) + sign(classifier_improvement(i))*3, ...
-                sprintf('%+.1f%%', classifier_improvement(i)), ...
-                'HorizontalAlignment', 'center', 'FontWeight', 'bold', 'FontSize', 8);
-        end
-    else
-        for i = 1:length(phase_improvement)
-            text(i, phase_improvement(i) + sign(phase_improvement(i))*3, ...
-                sprintf('%+.1f%%', phase_improvement(i)), ...
-                'HorizontalAlignment', 'center', 'FontWeight', 'bold');
-        end
-    end
-    
-    % 4. Error distributions
-    subplot(2, 3, 4);
-    hold on;
-    histogram(metrics_abs.correlations, 20, 'FaceColor', 'r', 'FaceAlpha', 0.5);
-    histogram(metrics_phase.correlations, 20, 'FaceColor', 'g', 'FaceAlpha', 0.5);
-    
-    if ~isempty(metrics_classifier)
-        histogram(metrics_classifier.correlations, 20, 'FaceColor', 'b', 'FaceAlpha', 0.5);
-        legend({'Abs Only', 'Phase Model', 'Global Classifier'}, 'Location', 'northwest');
-    else
-        legend({'Abs Only', 'Phase Model'}, 'Location', 'northwest');
-    end
-    
-    title('Correlation Distribution');
-    xlabel('Correlation');
-    ylabel('Count');
-    grid on;
-    hold off;
-    
-    % 5. Create summary text
-    subplot(2, 3, 5);
-    
-    if ~isempty(metrics_classifier)
-        summary_text = sprintf(['Pipeline Performance Summary:\n\n', ...
-            'Absolute Only Model:\n', ...
-            '  Correlation: %.4f ± %.4f\n', ...
-            '  Amp RMSE: %.4f\n', ...
-            '  Phase RMSE: %.4f\n', ...
-            '  Sign Acc: %.2f%%\n', ...
-            '  Rel Sign Acc: %.2f%%\n\n', ...
-            'Phase Sign Model:\n', ...
-            '  Correlation: %.4f ± %.4f\n', ...
-            '  Amp RMSE: %.4f\n', ...
-            '  Phase RMSE: %.4f\n', ...
-            '  Sign Acc: %.2f%%\n', ...
-            '  Rel Sign Acc: %.2f%%\n\n', ...
-            'Global Classifier:\n', ...
-            '  Correlation: %.4f ± %.4f\n', ...
-            '  Amp RMSE: %.4f\n', ...
-            '  Phase RMSE: %.4f\n', ...
-            '  Sign Acc: %.2f%%\n', ...
-            '  Rel Sign Acc: %.2f%%\n'], ...
-            metrics_abs.mean_correlation, metrics_abs.std_correlation, ...
-            metrics_abs.amplitude_rmse, metrics_abs.phase_rmse, ...
-            metrics_abs.phase_sign_accuracy*100, metrics_abs.relative_sign_accuracy*100, ...
-            metrics_phase.mean_correlation, metrics_phase.std_correlation, ...
-            metrics_phase.amplitude_rmse, metrics_phase.phase_rmse, ...
-            metrics_phase.phase_sign_accuracy*100, metrics_phase.relative_sign_accuracy*100, ...
-            metrics_classifier.mean_correlation, metrics_classifier.std_correlation, ...
-            metrics_classifier.amplitude_rmse, metrics_classifier.phase_rmse, ...
-            metrics_classifier.phase_sign_accuracy*100, metrics_classifier.relative_sign_accuracy*100);
-    else
-        summary_text = sprintf(['Pipeline Performance Summary:\n\n', ...
-            'Absolute Only Model:\n', ...
-            '  Correlation: %.4f ± %.4f\n', ...
-            '  Amp RMSE: %.4f\n', ...
-            '  Phase RMSE: %.4f\n', ...
-            '  Sign Acc: %.2f%%\n', ...
-            '  Rel Sign Acc: %.2f%%\n\n', ...
-            'Phase Sign Model:\n', ...
-            '  Correlation: %.4f ± %.4f\n', ...
-            '  Amp RMSE: %.4f\n', ...
-            '  Phase RMSE: %.4f\n', ...
-            '  Sign Acc: %.2f%%\n', ...
-            '  Rel Sign Acc: %.2f%%\n'], ...
-            metrics_abs.mean_correlation, metrics_abs.std_correlation, ...
-            metrics_abs.amplitude_rmse, metrics_abs.phase_rmse, ...
-            metrics_abs.phase_sign_accuracy*100, metrics_abs.relative_sign_accuracy*100, ...
-            metrics_phase.mean_correlation, metrics_phase.std_correlation, ...
-            metrics_phase.amplitude_rmse, metrics_phase.phase_rmse, ...
-            metrics_phase.phase_sign_accuracy*100, metrics_phase.relative_sign_accuracy*100);
-    end
-    
-    text(0.5, 0.5, summary_text, 'HorizontalAlignment', 'center', ...
-        'FontSize', 9, 'VerticalAlignment', 'middle');
-    axis off;
-    
-    % 6. Modal intensity patterns for high-mode fibers
-    subplot(2, 3, 6);
-    
-    % Calculate mode power distribution
-    mode_powers_true = mean(YTest(:, 1:number_of_modes).^2, 1);
-    mode_powers_pred_abs = mean(metrics_abs.pred_amplitudes.^2, 1);
-    mode_powers_pred_phase = mean(metrics_phase.pred_amplitudes.^2, 1);
-    
-    % Plot mode intensities
-    hold on;
-    plot(1:number_of_modes, mode_powers_true, 'k-', 'LineWidth', 2);
-    plot(1:number_of_modes, mode_powers_pred_abs, 'r--', 'LineWidth', 1.5);
-    plot(1:number_of_modes, mode_powers_pred_phase, 'g-.', 'LineWidth', 1.5);
-    
-    if ~isempty(metrics_classifier)
-        mode_powers_pred_classifier = mean(metrics_classifier.pred_amplitudes.^2, 1);
-        plot(1:number_of_modes, mode_powers_pred_classifier, 'b:', 'LineWidth', 1.5);
-        legend({'Ground Truth', 'Abs Only', 'Phase Model', 'Global Classifier'}, 'Location', 'best');
-    else
-        legend({'Ground Truth', 'Abs Only', 'Phase Model'}, 'Location', 'best');
-    end
-    
-    title('Mode Power Distribution');
-    xlabel('Mode Index');
-    ylabel('Mean Power');
-    grid on;
-    hold off;
-    
-    % Set title for the entire figure
-    sgtitle('MMF Pipeline Evaluation', 'FontSize', 14);
 end
 
-function visualizeExamples(XTest, YTest, recon_abs, recon_phase, recon_classifier, number_of_modes)
-    % Select a few examples to visualize
-    numExamples = 3;
-    figure('Name', 'Example Reconstructions', 'Position', [150, 150, 1200, 400]);
+function ground_truth_flips = getGroundTruthFlips(pred_signs, true_signs)
+    % Determine if global sign flips are needed
+    % 1 = flip needed, 0 = keep as is
+    numSamples = size(pred_signs, 1);
+    ground_truth_flips = zeros(numSamples, 1);
     
-    % Pick examples with different performance
-    if ~isempty(recon_classifier)
-        % We have all three methods
-        rows = 4;
-        labels = {'Original', 'Abs Only', 'Phase Model', 'Global Classifier'};
-    else
-        % We have only abs and phase models
-        rows = 3;
-        labels = {'Original', 'Abs Only', 'Phase Model'};
+    for i = 1:numSamples
+        % Count matches in original vs flipped version
+        matches_original = sum(pred_signs(i,:) == true_signs(i,:));
+        matches_flipped = sum(-pred_signs(i,:) == true_signs(i,:));
+        
+        % Determine if flip is needed
+        if matches_flipped > matches_original
+            ground_truth_flips(i) = 1; % Flip needed
+        end
     end
+end
+
+function displayResults(metrics, reconstructions, options)
+    % Display evaluation results
     
-    % Try to pick diverse examples (good, medium, poor reconstruction)
-    example_indices = findDiverseExamples(XTest, recon_phase, numExamples);
+    % 1. Display metrics
+    fprintf('\n=== MMF Decomposition Pipeline Evaluation Results ===\n\n');
     
-    for i = 1:numExamples
-        idx = example_indices(i);
+    fprintf('Amplitude Metrics:\n');
+    fprintf('  RMSE: %.4f\n', metrics.amp_rmse);
+    fprintf('  MAE: %.4f\n', metrics.amp_mae);
+    fprintf('  Relative Error: %.2f%%\n', metrics.amp_rel_error * 100);
+    
+    fprintf('\nPhase Magnitude Metrics:\n');
+    fprintf('  RMSE: %.4f\n', metrics.phase_mag_rmse);
+    fprintf('  MAE: %.4f\n', metrics.phase_mag_mae);
+    fprintf('  Relative Error: %.2f%%\n', metrics.phase_mag_rel_error * 100);
+    
+    fprintf('\nPhase Sign Metrics:\n');
+    fprintf('  Initial Overall Accuracy: %.2f%%\n', metrics.overall_sign_accuracy * 100);
+    fprintf('  Initial Weighted Accuracy: %.2f%%\n', metrics.weighted_sign_accuracy * 100);
+    fprintf('  Global Classifier Accuracy: %.2f%%\n', metrics.global_sign_accuracy * 100);
+    fprintf('  Final Overall Accuracy: %.2f%%\n', metrics.final_overall_sign_accuracy * 100);
+    fprintf('  Final Weighted Accuracy: %.2f%%\n', metrics.final_weighted_sign_accuracy * 100);
+    fprintf('  Accuracy Improvement: %.2f%%\n', metrics.sign_accuracy_improvement * 100);
+    fprintf('  Weighted Accuracy Improvement: %.2f%%\n', metrics.weighted_accuracy_improvement * 100);
+    
+    fprintf('\nReconstruction Metrics:\n');
+    fprintf('  Prediction RMSE: %.4f\n', metrics.recon_rmse);
+    fprintf('  Ground Truth RMSE: %.4f\n', metrics.gt_rmse);
+    fprintf('  Prediction Correlation: %.4f\n', metrics.recon_corr);
+    fprintf('  Ground Truth Correlation: %.4f\n', metrics.gt_corr);
+    fprintf('  Prediction Relative Error: %.2f%%\n', metrics.recon_rel_error * 100);
+    fprintf('  Ground Truth Relative Error: %.2f%%\n', metrics.gt_rel_error * 100);
+    
+    % 2. Display visualizations if enabled
+    if options.showPlots
+        % Create visualization of results for sampled images
+        n_samples = length(reconstructions.indices);
         
-        % Original image
-        subplot(rows, numExamples, i);
-        imagesc(XTest(:,:,1,idx));
-        axis image off;
-        title(sprintf('Original #%d', idx));
+        % Plot format will depend on number of samples
+        if n_samples <= 4
+            rows = 1;
+            cols = n_samples;
+        else
+            rows = ceil(n_samples/4);
+            cols = min(4, n_samples);
+        end
         
-        % Absolute model reconstruction
-        subplot(rows, numExamples, i+numExamples);
-        imagesc(recon_abs(:,:,1,idx));
-        axis image off;
-        corr_abs = corr2(XTest(:,:,1,idx), recon_abs(:,:,1,idx));
-        title(sprintf('Abs Only (r=%.3f)', corr_abs));
+        % Plot reconstructions
+        figure('Name', 'MMF Decomposition Pipeline Evaluation', 'Position', [100, 100, 1200, 800]);
         
-        % Phase model reconstruction
-        subplot(rows, numExamples, i+2*numExamples);
-        imagesc(recon_phase(:,:,1,idx));
-        axis image off;
-        corr_phase = corr2(XTest(:,:,1,idx), recon_phase(:,:,1,idx));
-        title(sprintf('Phase Model (r=%.3f)', corr_phase));
-        
-        % Global classifier reconstruction (if available)
-        if ~isempty(recon_classifier)
-            subplot(rows, numExamples, i+3*numExamples);
-            imagesc(recon_classifier(:,:,1,idx));
+        for i = 1:n_samples
+            % Original image
+            subplot(3, n_samples, i);
+            imagesc(extract(reconstructions.original(:,:,:,i)));
             axis image off;
-            corr_classifier = corr2(XTest(:,:,1,idx), recon_classifier(:,:,1,idx));
-            title(sprintf('Global Class (r=%.3f)', corr_classifier));
+            if i == 1
+                ylabel('Original');
+            end
+            title(sprintf('Sample #%d', reconstructions.indices(i)));
+            
+            % Ground truth reconstruction
+            subplot(3, n_samples, i + n_samples);
+            imagesc(extract(reconstructions.ground_truth(:,:,:,i)));
+            axis image off;
+            if i == 1
+                ylabel('Ground Truth');
+            end
+            title(sprintf('r=%.3f', reconstructions.gt_correlations(i)));
+            
+            % Predicted reconstruction
+            subplot(3, n_samples, i + 2*n_samples);
+            imagesc(extract(reconstructions.predicted(:,:,:,i)));
+            axis image off;
+            if i == 1
+                ylabel('Predicted');
+            end
+            title(sprintf('r=%.3f', reconstructions.correlations(i)));
         end
+        
+        % Plot phase sign accuracies
+        figure('Name', 'Phase Sign Accuracies', 'Position', [100, 500, 800, 400]);
+        
+        % Mode-specific accuracies
+        subplot(1, 2, 1);
+        bar(metrics.final_mode_sign_accuracy * 100);
+        xlabel('Mode Number');
+        ylabel('Accuracy (%)');
+        title('Phase Sign Accuracy by Mode');
+        grid on;
+        ylim([0, 100]);
+        
+        % Sign accuracy improvement
+        subplot(1, 2, 2);
+        bar([metrics.overall_sign_accuracy, metrics.final_overall_sign_accuracy] * 100);
+        set(gca, 'XTickLabel', {'Before Global Classifier', 'After Global Classifier'});
+        ylabel('Accuracy (%)');
+        title('Phase Sign Accuracy Improvement');
+        grid on;
+        ylim([0, 100]);
     end
-    
-        % ...existing code...
-    for i = 1:rows
-        pos = get(subplot(rows, numExamples, (i-1)*numExamples+1), 'Position');
-        % Clamp position values to [0, 1]
-        x = max(min(pos(1)-0.15, 1), 0);
-        y = max(min(pos(2), 1), 0);
-        w = max(min(0.1, 1-x), 0);
-        h = max(min(pos(4), 1-y), 0);
-        annotation('textbox', [x, y, w, h], ...
-            'String', labels{i}, 'EdgeColor', 'none', ...
-            'FontSize', 12, 'FontWeight', 'bold', 'HorizontalAlignment', 'right');
-    end
-    
-    % Overall title
-    sgtitle('Example Reconstructions', 'FontSize', 14);
-end
-
-function indices = findDiverseExamples(XTest, reconstructed, numExamples)
-    % Find examples with varying reconstruction quality
-    numTotal = size(XTest, 4);
-    correlations = zeros(numTotal, 1);
-    
-    for i = 1:numTotal
-        correlations(i) = corr2(XTest(:,:,1,i), reconstructed(:,:,1,i));
-    end
-    
-    % Sort correlations
-    [sorted_corrs, sorted_idx] = sort(correlations);
-    
-    % Pick examples: one bad, one medium, one good
-    indices = zeros(numExamples, 1);
-    
-    % Find the worst example (but not too bad)
-    worst_idx = find(sorted_corrs > 0.1, 1, 'first');
-    if isempty(worst_idx)
-        worst_idx = 1;
-    end
-    indices(1) = sorted_idx(worst_idx);
-    
-    % Find a medium example
-    med_idx = round(length(sorted_corrs) / 2);
-    indices(2) = sorted_idx(med_idx);
-    
-    % Find a good example (but not too perfect)
-    best_idx = find(sorted_corrs < 0.98, 1, 'last');
-    if isempty(best_idx)
-        best_idx = length(sorted_corrs);
-    end
-    indices(3) = sorted_idx(best_idx);
-    
-    % Ensure we have unique examples
-    if length(unique(indices)) < numExamples
-        % Just pick evenly spaced examples
-        step = floor(numTotal / (numExamples + 1));
-        indices = step * (1:numExamples)';
-    end
-end
-
-function result = canUseGPU()
-    % Check if GPU is available
-    persistent useGPU;
-    if isempty(useGPU)
-        useGPU = false;
-        try
-            % Check for CUDA GPU
-            gpuArray(1);
-            useGPU = true;
-        catch
-            useGPU = false;
-        end
-    end
-    result = useGPU;
 end

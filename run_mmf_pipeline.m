@@ -1,138 +1,198 @@
-% Main script to run the entire MMF mode decomposition pipeline
+% filepath: c:\Users\nicks\MATLAB\Projects\MT2_prak\mmf_decomp\run_mmf_pipeline.m
+% run_mmf_pipeline.m - Main script to run the complete MMF decomposition pipeline
+% This script orchestrates training and evaluation of all models in the pipeline
+% 
+% You can execute each section separately using the "Run Section" button in MATLAB
+% or by placing your cursor in a section and pressing Ctrl+Enter
 
-% Clear workspace and command window
-clear all;
-% close all;
-% clc;
+%% Initialize Pipeline and Configuration
+tic; % Start timing the pipeline
 
-% Load dataset
-if ~exist('mmf_train', 'var')
-    disp('Loading dataset...');
-    load('mmf_dataset_multi_sign.mat');
-end
-
-% Step 0: Preprocess labels - enforce canonical sign representation by forcing the first sign to be positive
-disp('========== STEP 0: PREPROCESSING LABELS ==========');
-labels_train_canonical = labels_train;
-labels_val_canonical = labels_val;
-labels_test_canonical = labels_test;
-
-numModes = (size(labels_train, 2) + 1) / 2; % Determine numModes from label size
-phase_indices = (numModes + 1):(2 * numModes - 1);
-
-fprintf('Processing dataset with %d modes (%d phases, %d phase signs to predict)\n', ...
-    numModes, numModes-1, numModes-2);
-
-% Canonicalize training data
-for i = 1:size(labels_train, 1)
-    % Ensure the first phase sign is positive
-    if labels_train(i, numModes+1) < 0
-        labels_train_canonical(i, phase_indices) = -labels_train(i, phase_indices);
-    end
-end
-
-% Canonicalize validation data
-for i = 1:size(labels_val, 1)
-    % Ensure the first phase sign is positive
-    if labels_val(i, numModes+1) < 0
-        labels_val_canonical(i, phase_indices) = -labels_val(i, phase_indices);
-    end
-end
-
-% Canonicalize test data
-for i = 1:size(labels_test, 1)
-    % Ensure the first phase sign is positive
-    if labels_test(i, numModes+1) < 0
-        labels_test_canonical(i, phase_indices) = -labels_test(i, phase_indices);
-    end
-end
-
-fprintf('Data canonicalization complete. First phase sign forced to positive.\n');
-
-% Step 0.5: Precompute BPMmatlab model and modes ONCE for all image generation
-P = BPMmatlab.model;
-P.name = 'pipeline_main';
-P.useAllCPUs = true;
-P.useGPU = true;
-P.Lx_main = 50e-6;
-P.Ly_main = 50e-6;
-P.Nx_main = 64; % Use dataset image size
-P.Ny_main = 64;
-P.padfactor = 1.5;
-P.dz_target = 1e-6;
-P.lambda = 1000e-9;
-P.n_background = 1.45;
-P.n_0 = 1.46;
-P.Lz = 10e-4;
-P.updates = 1;
-core_radius = 25e-6;
-n_core = P.n_0;
-n_clad = P.n_background;
-P = initializeRIfromFunction(P, @(X,Y,~,~) n_clad + (n_core-n_clad)*(X.^2+Y.^2 < core_radius^2));
-P = findModes(P, numModes, 'plotModes', false);
-
-% Pass P to all mmf_build_image calls in downstream scripts for consistent mode basis
-
-% Step 1a: Train model for absolute amplitudes and phases
-disp('========== STEP 1a: TRAINING MODEL FOR MAGNITUDES PREDICTION ==========');
+% Pipeline configuration - modify these settings as needed
+datasetFile = 'mmf_dataset_multi_sign.mat';
 options = struct();
-options.initialLearnRate = 1e-4;
-options.maxEpochs = 100;
-options.miniBatchSize = 128;
-options.validationFrequency = 300;
-options.validationPatience = 30;
-options.executionEnvironment = "gpu";
-options.modelType = "MLP";
-options.plotProgress = "gui";
-options.useReconLoss = false; % Disable reconstruction loss for amplitude training
-options.showSignAccuracy = true;
-options.evaluationFrequency = 1000;
-options.adaptiveLossWeights = false;
+options.trainAmpModel = true;       % Set to false to skip amplitude model training
+options.trainPhaseModel = true;     % Set to false to skip phase sign model training
+options.trainGlobalClassifier = true; % Set to false to skip global classifier training
+options.evaluate = true;            % Set to false to skip final evaluation
+options.executionEnvironment = "gpu"; % Set to "cpu" if no GPU is available
+options.batchSize = 64;             % Batch size for training
+options.maxEpochs = 100;            % Maximum training epochs
+options.initialLearnRate = 1e-4;    % Initial learning rate
+options.plotProgress = "gui";       % Set to "none" to disable training plots
+options.validationFrequency = 50;   % Validation frequency during training
+options.validationPatience = 20;    % Patience for early stopping
 
-dlnet_amplitude = train_absolute_model(mmf_train, labels_train_canonical, mmf_val, labels_val_canonical, options);
-save('amplitude_model.mat', 'dlnet_amplitude', 'number_of_modes');
+% Get utility functions
+utils = mmf_utils();
 
-% Step 1b: Train dedicated model for phase prediction
-disp('========== STEP 1b: TRAINING SPECIALIZED MODEL FOR PHASE PREDICTION ==========');
+%% Load Dataset
+try
+    fprintf('Loading dataset from %s...\n', datasetFile);
+    data = load(datasetFile);
+    
+    % Extract data fields
+    mmf_train = data.mmf_train;
+    mmf_val = data.mmf_val;
+    mmf_test = data.mmf_test;
+    labels_train = data.labels_train;
+    labels_val = data.labels_val;
+    labels_test = data.labels_test;
+    number_of_modes = data.number_of_modes;
+    
+    fprintf('Dataset loaded successfully. Number of modes: %d\n', number_of_modes);
+    fprintf('Training samples: %d, Validation samples: %d, Test samples: %d\n', ...
+        size(mmf_train, 4), size(mmf_val, 4), size(mmf_test, 4));
+catch ME
+    error('Failed to load dataset: %s', ME.message);
+end
 
-% Extract amplitude and phase values from canonical labels
-amp_train = labels_train_canonical(:, 1:numModes);
-phase_train = labels_train_canonical(:, numModes+1:end);
-amp_val = labels_val_canonical(:, 1:numModes);
-phase_val = labels_val_canonical(:, numModes+1:end);
+%% Validate Data Format
+% Check dimensions of training data
+if ndims(mmf_train) ~= 4 || size(mmf_train, 3) ~= 1
+    error('mmf_train should have dimensions [height x width x 1 x samples]');
+end
 
-% Standard settings for lower mode counts
-options.initialLearnRate = 1e-4;
-options.maxEpochs = 100;
-options.miniBatchSize = 128;
-options.validationFrequency = 50;
-options.validationPatience = 40;
-options.modelType = "PhaseSignMLP"; 
-options.evaluationFrequency = 500;
-options.correlationWeight = 0.6;
-options.signLossWeight = 0.4;
+% Check dimensions of labels
+expectedLabelCols = 2*number_of_modes - 1; % amplitudes + phases
+if size(labels_train, 2) ~= expectedLabelCols
+    error('labels_train should have dimensions [samples x %d]', expectedLabelCols);
+end
 
-% Train the phase model with appropriate options
-dlnet_phase = train_phase_sign_model(mmf_train, amp_train, phase_train, mmf_val, amp_val, phase_val, options);
-save('phase_sign_model.mat', 'dlnet_phase', 'number_of_modes');
+% Check number of samples match
+if size(mmf_train, 4) ~= size(labels_train, 1)
+    error('Number of samples in mmf_train and labels_train do not match');
+end
 
+% Check if labels are properly formatted (amplitudes followed by phases)
+amps = labels_train(:, 1:number_of_modes);
+if any(amps(:) < 0)
+    warning('Amplitudes contain negative values, which may indicate incorrect data formatting');
+end
 
-% Step 2: Generate and visualize residuals (optional - for further analysis)
-disp('========== STEP 2: GENERATING RESIDUALS ==========');
-generate_residuals(mmf_train, labels_train, mmf_val, labels_val, mmf_test, labels_test);
+% Check if phases are in the expected range (-pi to pi)
+phases = labels_train(:, number_of_modes+1:end);
+if any(abs(phases(:)) > pi*1.1) % allow a little margin for numerical issues
+    warning('Phases contain values outside the range [-pi,pi], which may indicate incorrect data formatting');
+end
 
-% Step 3: Train phase sign classifier for determining original or complex conjugate
-disp('========== STEP 3: TRAINING PHASE SIGN CLASSIFIER ==========');
-train_phase_sign_classifier(mmf_train, labels_train, mmf_val, labels_val, mmf_test, labels_test);
+%% Create BPMmatlab Model
+% Create BPMmatlab model with precomputed modes - will be passed to all components
+inputSize = [size(mmf_train, 1), size(mmf_train, 2)];
+fprintf('Creating BPMmatlab model with %d modes...\n', number_of_modes);
+P = utils.getOrCreateModelWithModes(number_of_modes, inputSize(1), true);
+fprintf('BPMmatlab model created with %d modes\n', number_of_modes);
 
-% Step 4: Evaluate pipeline with the enhanced approach
-disp('========== STEP 4: EVALUATING FULL PIPELINE ==========');
-evaluate_full_pipeline();
+% Configure training options
+trainingOptions = struct();
+trainingOptions.miniBatchSize = options.batchSize;
+trainingOptions.maxEpochs = options.maxEpochs;
+trainingOptions.initialLearnRate = options.initialLearnRate;
+trainingOptions.executionEnvironment = options.executionEnvironment;
+trainingOptions.plotProgress = options.plotProgress;
+trainingOptions.validationFrequency = options.validationFrequency;
+trainingOptions.validationPatience = options.validationPatience;
 
+%% Step 1: Train Amplitude and Phase Magnitude Model
+if options.trainAmpModel
+    fprintf('\n=== Step 1: Training amplitude and phase magnitude model ===\n');
+    
+    % Extract training labels
+    YTrain_amps = labels_train(:, 1:number_of_modes);
+    YTrain_phases = labels_train(:, number_of_modes+1:end);
+    YVal_amps = labels_val(:, 1:number_of_modes);
+    YVal_phases = labels_val(:, number_of_modes+1:end);
+    
+    % Train the model with precomputed modes
+    train_absolute_model(mmf_train, YTrain_amps, YTrain_phases, ...
+                         mmf_val, YVal_amps, YVal_phases, ...
+                         trainingOptions, P);
+    
+    fprintf('Amplitude and phase magnitude model training completed\n');
+else
+    fprintf('\n=== Step 1: Skipping amplitude and phase magnitude model training ===\n');
+end
 
-% Nonlinear performance evaluation
-disp('========== STEP 5: EVALUATING NONLINEAR PERFORMANCE ==========');
-% evaluate_nonlinear_performance();
+%% Step 2: Train Phase Sign Model
+if options.trainPhaseModel
+    fprintf('\n=== Step 2: Training phase sign model ===\n');
+    
+    % Extract training labels
+    YTrain_amps = labels_train(:, 1:number_of_modes);
+    YTrain_phases = labels_train(:, number_of_modes+1:end);
+    YVal_amps = labels_val(:, 1:number_of_modes);
+    YVal_phases = labels_val(:, number_of_modes+1:end);
+    
+    % Train the model with precomputed modes
+    train_phase_sign_model(mmf_train, YTrain_amps, YTrain_phases, ...
+                           mmf_val, YVal_amps, YVal_phases, ...
+                           trainingOptions, P);
+    
+    fprintf('Phase sign model training completed\n');
+else
+    fprintf('\n=== Step 2: Skipping phase sign model training ===\n');
+end
 
+%% Step 3: Generate Residuals and Train Global Sign Classifier
+if options.trainGlobalClassifier
+    fprintf('\n=== Step 3: Generating residuals and training global classifier ===\n');
+    
+    % Generate residuals using precomputed modes
+    fprintf('Generating residuals for training classifier...\n');
+    generate_residuals(mmf_train, labels_train, mmf_val, labels_val, mmf_test, labels_test, P);
+    
+    % Train classifier
+    fprintf('Training global phase sign classifier...\n');
+    train_phase_sign_classifier(mmf_train, labels_train, mmf_val, labels_val, mmf_test, labels_test, trainingOptions, P);
+    
+    fprintf('Global phase sign classifier training completed\n');
+else
+    fprintf('\n=== Step 3: Skipping global sign classifier training ===\n');
+end
 
-disp('Complete pipeline execution finished!');
+%% Step 4: Evaluate Full Pipeline
+if options.evaluate
+    fprintf('\n=== Step 4: Evaluating full pipeline ===\n');
+    
+    % Create evaluation options
+    evalOptions = struct();
+    evalOptions.showPlots = true;
+    evalOptions.batchSize = trainingOptions.miniBatchSize;
+    evalOptions.executionEnvironment = trainingOptions.executionEnvironment;
+    evalOptions.numSamplesToShow = 8;
+    
+    % Evaluate with precomputed modes
+    fprintf('Running full pipeline evaluation...\n');
+    evaluate_full_pipeline(mmf_test, labels_test, evalOptions, P);
+    
+    fprintf('Pipeline evaluation completed\n');
+else
+    fprintf('\n=== Step 4: Skipping pipeline evaluation ===\n');
+end
+
+%% Display Final Summary
+% Report total execution time
+elapsedTime = toc;
+fprintf('\n=== Pipeline Execution Complete ===\n');
+fprintf('Total execution time: %.2f seconds (%.2f minutes)\n', elapsedTime, elapsedTime/60);
+
+% Display model file information
+if exist('absolute_model.mat', 'file')
+    info = dir('absolute_model.mat');
+    fprintf('Amplitude model file size: %.2f MB\n', info.bytes/1024/1024);
+end
+
+if exist('phase_sign_model.mat', 'file')
+    info = dir('phase_sign_model.mat');
+    fprintf('Phase sign model file size: %.2f MB\n', info.bytes/1024/1024);
+end
+
+if exist('phase_sign_classifier.mat', 'file')
+    info = dir('phase_sign_classifier.mat');
+    fprintf('Global classifier file size: %.2f MB\n', info.bytes/1024/1024);
+end
+
+if exist('pipeline_evaluation.mat', 'file')
+    info = dir('pipeline_evaluation.mat');
+    fprintf('Evaluation results file size: %.2f MB\n', info.bytes/1024/1024);
+end

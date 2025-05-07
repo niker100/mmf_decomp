@@ -53,31 +53,27 @@ function P = getOrCreateModelWithModes(number_of_modes, image_size, use_cached)
     cached_P = P;
 end
 
-function [weights, full_phases] = createComplexWeights(amplitudes, phases, phase_signs, number_of_modes)
+function [weights, full_phases] = createComplexWeights(amplitudes, phases)
     % Create complex weights from amplitudes and phases
     % Inputs:
-    %   amplitudes - Mode amplitudes [number_of_modes x batch_size]
-    %   phases - Phase magnitudes [number_of_modes-1 x batch_size]
-    %   phase_signs - Phase signs [number_of_modes-1 x batch_size]
-    %   number_of_modes - Number of modes
+    %   amplitudes - Mode amplitudes [number_of_modes x batch_size] normalized to [0,1]
+    %   phases - Phase magnitudes [number_of_modes-1 x batch_size] normalized to [-1,1]
     %
     % Returns:
     %   weights - Complex weights for all modes [number_of_modes x batch_size]
     %   full_phases - Phases for all modes [number_of_modes x batch_size]
+
+    number_of_modes = size(amplitudes, 1);
     
     % Initialize outputs
     weights = zeros(number_of_modes, size(amplitudes, 2), 'like', amplitudes);
-    full_phases = zeros(number_of_modes, size(amplitudes, 2), 'like', phases);
     
     % First mode has zero phase (reference)
     weights(1, :) = amplitudes(1, :);
     
     % Remaining modes
     for m = 2:number_of_modes
-        phase_idx = m-1;
-        phase_value = phases(phase_idx, :) .* phase_signs(phase_idx, :);
-        full_phases(m, :) = phase_value;
-        weights(m, :) = amplitudes(m, :) .* exp(1i * phase_value * pi);
+        weights(m, :) = amplitudes(m, :) .* exp(1i * phases(m-1, :));
     end
 end
 
