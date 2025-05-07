@@ -1,11 +1,14 @@
 % filepath: c:\Users\nicks\MATLAB\Projects\MT2_prak\Versuch 3\train_absolute_model.m
 % train_absolute_model.m - Trains a network to predict absolute amplitudes and phases
 
-function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, options)
+function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, options, P_precomputed)
     % Parse options or use defaults
     if nargin < 5
         options = struct();
     end
+    
+    % Get utility functions
+    utils = mmf_utils();
     
     % Default options
     if ~isfield(options, 'initialLearnRate'), options.initialLearnRate = 5e-4; end
@@ -25,6 +28,13 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
     inputSize = [size(XTrain,1) size(XTrain,2)];
     outputSize = size(YTrain,2);
     number_of_modes = (outputSize+1) / 2;
+    
+    % Get or create BPMmatlab model with precomputed modes
+    if nargin < 6 || isempty(P_precomputed)
+        P = utils.getOrCreateModelWithModes(number_of_modes, inputSize(1), true);
+    else
+        P = P_precomputed;
+    end
     
     % Create network based on specified type if not loading existing model
     if strcmpi(options.modelType, "CNN")
@@ -95,7 +105,6 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
     % Initialize dynamic amplitude coefficient
     global ampCoeff;
     ampCoeff = 10;
-    alphaCoeff = 0.1;  % Smoothing factor for phase 2
     
     % Create data indices for batching
     numTrain = size(XTrain, 4);
@@ -127,11 +136,11 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
             
             % Train with optimized model for absolute value estimation
             [genGradients, genLoss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = ...
-                dlfeval(@modelGradients_abs, dlnet, dlX, dlY, options.useReconLoss, options.adaptiveLossWeights);
+                dlfeval(@modelGradients_abs, dlnet, dlX, dlY, P, options.useReconLoss, options.adaptiveLossWeights, utils);
             
             % Apply gradient clipping
             gradientThreshold = 1e-3;
-            genGradients = dlupdate(@(g) thresholdL2Norm(g, gradientThreshold), genGradients);
+            genGradients = dlupdate(@(g) utils.thresholdL2Norm(g, gradientThreshold), genGradients);
             
             % Update weights
             [dlnet, averageGrad, averageSqGrad] = adamupdate(dlnet, genGradients, ...
@@ -162,7 +171,7 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
             % Validation check
             if mod(iteration, options.validationFrequency) == 0
                 [validationLoss, valAmpLoss, valPhaseLoss] = modelValidation_abs(dlnet, XValidation, YValidation, ...
-                    options.miniBatchSize, options.executionEnvironment, options.useReconLoss, options.adaptiveLossWeights);
+                    P, options.miniBatchSize, options.executionEnvironment, options.useReconLoss, options.adaptiveLossWeights, utils);
                 
                 % Early stopping check
                 if validationLoss < bestValidationLoss
@@ -182,7 +191,6 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
                 YValTrue = YValidation';
                 
                 if options.showSignAccuracy
-
                     % Calculate phase sign accuracy (with ambiguity allowed)
                     phase_true = YValidation(:, number_of_modes+1:end)';
                     phase_pred = YValPred(number_of_modes+1:end,:);
@@ -191,7 +199,7 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
                     true_signs = sign(phase_true);
                     pred_signs = sign(phase_pred);
                     
-                    valSignAccuracy = calculateRelativeSignAccuracy(pred_signs, true_signs);
+                    valSignAccuracy = utils.calculateRelativeSignAccuracy(pred_signs, true_signs);
                     
                     % Log it to monitor
                     if strcmpi(options.plotProgress, "gui")
@@ -208,11 +216,10 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
                 end
             end
 
-                % Intermediate evaluation
+            % Intermediate evaluation
             if options.evaluationFrequency > 0 && mod(iteration, options.evaluationFrequency) == 0
-                performIntermediateEvaluation(dlnet, XValidation, YValidation, number_of_modes);
+                performIntermediateEvaluation(dlnet, XValidation, YValidation, number_of_modes, P);
             end
-
         end
         
         if patienceCounter >= options.validationPatience || stopTraining
@@ -223,22 +230,14 @@ function dlnet = train_absolute_model(XTrain, YTrain, XValidation, YValidation, 
     % Use best network
     dlnet = bestDlnet;
     
-    
     save('absolute_model.mat', 'dlnet', 'ampCoeff', 'number_of_modes');
     disp('Final absolute value model saved to absolute_model.mat');
-    
 end
 
-function accuracy = calculateRelativeSignAccuracy(pred_signs, true_signs)
-    % Calculate sign accuracy without allowing for global phase ambiguity
-    % (since the labels now use a canonical representation)
-    match_count = sum(sign(pred_signs) == true_signs, 'all');
-    total_elements = numel(pred_signs);
+function performIntermediateEvaluation(dlnet, X_val, Y_val, number_of_modes, P)
+    % Get utils
+    utils = mmf_utils();
     
-    accuracy = match_count / total_elements;
-end
-
-function performIntermediateEvaluation(dlnet, X_val, Y_val, number_of_modes)
     % Select a small subset for visualization
     evalSize = min(8, size(X_val, 4));
     indices = randperm(size(X_val, 4), evalSize);
@@ -277,7 +276,7 @@ function performIntermediateEvaluation(dlnet, X_val, Y_val, number_of_modes)
             phase_true_val = phase_true(m-1, i);
             
             % Convert normalized phase to radians
-            phase_pred_radians = phase_pred_val * pi; % (phase_pred_val * 2 - 1) * pi;
+            phase_pred_radians = phase_pred_val * pi;
             phase_true_radians = phase_true_val * pi;
             
             weights_pred(i, m) = amp_pred(m, i) * exp(1i * phase_pred_radians);
@@ -285,9 +284,9 @@ function performIntermediateEvaluation(dlnet, X_val, Y_val, number_of_modes)
         end
     end
     
-    % Create reconstructions
-    [recons_pred, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, weights_pred, true);
-    [recons_true, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, weights_true, true);
+    % Create reconstructions using precomputed P
+    [recons_pred, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, weights_pred, false, 0, P);
+    [recons_true, ~] = mmf_build_image(number_of_modes, size(X_eval, 1), evalSize, weights_true, false, 0, P);
     
     % Calculate correlations
     correlations = zeros(evalSize, 1);
@@ -518,401 +517,7 @@ function dlnet = createMLPModel(inputSize, outputSize)
     dlnet = dlnetwork(lgraph);
 end
 
-% Create VGG model (simplified version with reduced parameters)
-function dlnet = createVGGModel(inputSize, outputSize)
-    % Determine numModes from outputSize
-    numModes = (outputSize + 1) / 2;
-
-    layers = [
-        imageInputLayer([inputSize 1],'Name','input','Normalization','none') % Grayscale input
-
-        % Block 1 (Reduced Filters)
-        convolution2dLayer(3,32,'Padding','same','Name','conv1_1') % Reduced from 64
-        reluLayer('Name','relu1_1')
-        convolution2dLayer(3,32,'Padding','same','Name','conv1_2') % Reduced from 64
-        reluLayer('Name','relu1_2')
-        maxPooling2dLayer(2,'Stride',2,'Name','pool1')
-
-        % Block 2 (Reduced Filters)
-        convolution2dLayer(3,64,'Padding','same','Name','conv2_1') % Reduced from 128
-        reluLayer('Name','relu2_1')
-        convolution2dLayer(3,64,'Padding','same','Name','conv2_2') % Reduced from 128
-        reluLayer('Name','relu2_2')
-        maxPooling2dLayer(2,'Stride',2,'Name','pool2')
-
-        % Block 3 (Reduced Filters)
-        convolution2dLayer(3,128,'Padding','same','Name','conv3_1') % Reduced from 256
-        reluLayer('Name','relu3_1')
-        convolution2dLayer(3,128,'Padding','same','Name','conv3_2') % Reduced from 256
-        reluLayer('Name','relu3_2')
-        convolution2dLayer(3,128,'Padding','same','Name','conv3_3') % Reduced from 256
-        reluLayer('Name','relu3_3')
-        % Removed conv3_4 for shallower network
-        maxPooling2dLayer(2,'Stride',2,'Name','pool3')
-
-        % Block 4 (Reduced Filters)
-        convolution2dLayer(3,256,'Padding','same','Name','conv4_1') % Reduced from 512
-        reluLayer('Name','relu4_1')
-        convolution2dLayer(3,256,'Padding','same','Name','conv4_2') % Reduced from 512
-        reluLayer('Name','relu4_2')
-        convolution2dLayer(3,256,'Padding','same','Name','conv4_3') % Reduced from 512
-        reluLayer('Name','relu4_3')
-        % Removed conv4_4 for shallower network
-        maxPooling2dLayer(2,'Stride',2,'Name','pool4')
-
-        % Block 5 (Reduced Filters)
-        convolution2dLayer(3,256,'Padding','same','Name','conv5_1') % Reduced from 512
-        reluLayer('Name','relu5_1')
-        convolution2dLayer(3,256,'Padding','same','Name','conv5_2') % Reduced from 512
-        reluLayer('Name','relu5_2')
-        convolution2dLayer(3,256,'Padding','same','Name','conv5_3') % Reduced from 512
-        reluLayer('Name','relu5_3')
-        % Removed conv5_4 for shallower network
-        maxPooling2dLayer(2,'Stride',2,'Name','pool5')
-
-        % --- Replace Large FC layers with Global Average Pooling ---
-        globalAveragePooling2dLayer('Name','gap')
-        % Removed fc6, relu6, drop6, fc7, relu7, drop7
-    ];
-
-    lgraph = layerGraph(layers);
-
-    % --- Amplitude Branch ---
-    ampBranch = [
-        fullyConnectedLayer(256, 'Name', 'AmpFC1') % Reduced from 512
-        reluLayer('Name', 'AmpReLU1')
-        dropoutLayer(0.3, 'Name', 'AmpDrop1')
-        fullyConnectedLayer(numModes, 'Name', 'AmpOut')
-        functionLayer(@normalizeAmplitudesFunc, 'Name', 'AmpNorm', 'Formattable', true, 'Acceleratable', true)
-    ];
-    lgraph = addLayers(lgraph, ampBranch);
-    lgraph = connectLayers(lgraph, 'gap', 'AmpFC1'); % Connect from GAP layer
-
-    % --- Phase Branch ---
-    phaseBranch = [
-        fullyConnectedLayer(256, 'Name', 'PhaseFC1') % Reduced from 512
-        reluLayer('Name', 'PhaseReLU1')
-        dropoutLayer(0.3, 'Name', 'PhaseDrop1')
-        fullyConnectedLayer(numModes - 1, 'Name', 'PhaseOut') % numModes-1 phases
-        %sigmoidLayer('Name', 'PhaseSigmoid')
-        tanhLayer('Name', 'PhaseSigmoid') % Use tanh for phase output
-    ];
-    lgraph = addLayers(lgraph, phaseBranch);
-    lgraph = connectLayers(lgraph, 'gap', 'PhaseFC1'); % Connect from GAP layer
-
-    % --- Concatenate Outputs ---
-    lgraph = addLayers(lgraph, depthConcatenationLayer(2, 'Name', 'OutputConcat'));
-    lgraph = connectLayers(lgraph, 'AmpNorm', 'OutputConcat/in1');
-    lgraph = connectLayers(lgraph, 'PhaseSigmoid', 'OutputConcat/in2');
-
-    dlnet = dlnetwork(lgraph);
-    disp('Reduced VGG-based model with split output created.');
-end
-
-function dlnet = createResNet(inputSize, outputSize)
-    % Create a ResNet-based architecture for phase sign prediction
-    % This network uses residual connections for better gradient flow
-
-    numModes = (outputSize + 1) / 2;
-
-    layers = [
-        imageInputLayer([inputSize 1], 'Name', 'input', 'Normalization', 'none')
-        % Initial convolution
-        convolution2dLayer(7, 32, 'Stride', 2, 'Padding', 'same', 'Name', 'conv1')
-        reluLayer('Name', 'relu1')
-        maxPooling2dLayer(3, 'Stride', 2, 'Padding', 'same', 'Name', 'pool1')
-    ];
-
-    lgraph = layerGraph(layers);
-
-    % Residual block function
-    function lgraph = addResidualBlock(lgraph, numFilters, blockName, inName)
-        % Create main path
-        mainPath = [
-            convolution2dLayer(3, numFilters, 'Padding', 'same', 'Name', [blockName '_conv1'])
-            reluLayer('Name', [blockName '_relu1'])
-            convolution2dLayer(3, numFilters, 'Padding', 'same', 'Name', [blockName '_conv2'])
-        ];
-
-        lgraph = addLayers(lgraph, mainPath);
-
-        % Connect from input to first layer of block
-        lgraph = connectLayers(lgraph, inName, [blockName '_conv1']);
-
-        % Add skip connection - simplified approach without findLayerIndex
-        skipOutput = inName;
-
-        % If dimensions need to match (like in downsampling)
-        if contains(blockName, 'downsample') || ~strcmp(inName, 'pool1')
-            skipPath = [
-                convolution2dLayer(1, numFilters, 'Stride', 1, 'Name', [blockName '_skip'])
-            ];
-            lgraph = addLayers(lgraph, skipPath);
-            lgraph = connectLayers(lgraph, inName, [blockName '_skip']);
-            skipOutput = [blockName '_skip'];
-        end
-
-        % Add layer for combining main and skip paths
-        add = additionLayer(2, 'Name', [blockName '_add']);
-        relu = reluLayer('Name', [blockName '_relu_out']);
-
-        lgraph = addLayers(lgraph, [add; relu]);
-        lgraph = connectLayers(lgraph, [blockName '_conv2'], [blockName '_add/in1']);
-        lgraph = connectLayers(lgraph, skipOutput, [blockName '_add/in2']);
-    end
-
-    % Add residual blocks
-    % First block group (32 filters)
-    lgraph = addResidualBlock(lgraph, 32, 'block1a', 'pool1');
-    lgraph = addResidualBlock(lgraph, 32, 'block1b', 'block1a_relu_out');
-
-    % Second block group (64 filters) with downsampling
-    lgraph = addResidualBlock(lgraph, 64, 'block2a_downsample', 'block1b_relu_out');
-    lgraph = addResidualBlock(lgraph, 64, 'block2b', 'block2a_downsample_relu_out');
-
-    % Third block group (128 filters) with downsampling
-    lgraph = addResidualBlock(lgraph, 128, 'block3a_downsample', 'block2b_relu_out');
-    lgraph = addResidualBlock(lgraph, 128, 'block3b', 'block3a_downsample_relu_out');
-
-    % Global average pooling
-    lgraph = addLayers(lgraph, globalAveragePooling2dLayer('Name', 'gap'));
-    lgraph = connectLayers(lgraph, 'block3b_relu_out', 'gap');
-
-    % Amplitude branch
-    ampBranch = [
-        fullyConnectedLayer(numModes, 'Name', 'AmpOut')
-        sigmoidLayer('Name', 'AmpSigmoid')
-    ];
-    lgraph = addLayers(lgraph, ampBranch);
-    lgraph = connectLayers(lgraph, 'gap', 'AmpOut');
-
-    % Phase branch
-    phaseBranch = [
-        fullyConnectedLayer(numModes-1, 'Name', 'PhaseOut')
-        tanhLayer('Name', 'PhaseTanh')
-    ];
-    lgraph = addLayers(lgraph, phaseBranch);
-    lgraph = connectLayers(lgraph, 'gap', 'PhaseOut');
-
-    % Concatenate outputs
-    lgraph = addLayers(lgraph, depthConcatenationLayer(2, 'Name', 'OutputConcat'));
-    lgraph = connectLayers(lgraph, 'AmpSigmoid', 'OutputConcat/in1');
-    lgraph = connectLayers(lgraph, 'PhaseTanh', 'OutputConcat/in2');
-
-    % Create network
-    dlnet = dlnetwork(lgraph);
-end
-
-function dlnet = createCustomModel(inputSize, outputSize)
-    % Determine numModes from outputSize
-    numModes = (outputSize + 1) / 2;
-    
-    % Handle input size - ensure it's compatible with EfficientNet
-    requiredInputSize = [224 224]; % Standard EfficientNet input size
-    if ~isequal(inputSize, requiredInputSize)
-        warning('Input size not %dx%d. Resizing input layer. Ensure data matches.', requiredInputSize(1), requiredInputSize(2));
-        inputSize = requiredInputSize;
-    end
-    
-    % Create EfficientNet-B0 backbone
-    lgraph = efficientnetb0('Weights', 'none');
-    
-    % --- Modification for Grayscale Input ---
-    % Get the input layer
-    inputLayer = lgraph.Layers(1);
-    % Create a new input layer for grayscale
-    newInputLayer = imageInputLayer([inputSize 1], 'Name', inputLayer.Name, 'Normalization', inputLayer.Normalization);
-    lgraph = replaceLayer(lgraph, inputLayer.Name, newInputLayer);
-    
-    % Get the first convolution layer
-    firstConvLayer = lgraph.Layers(2); % Usually the first conv layer
-    % Create a new conv layer with adjusted weights for 1 channel input
-    originalWeights = firstConvLayer.Weights;
-    % Average weights across the color channels (simple approach)
-    newWeights = mean(originalWeights, 3); 
-    newConvLayer = convolution2dLayer(firstConvLayer.FilterSize, firstConvLayer.NumFilters, ...
-        'Name', firstConvLayer.Name, ...
-        'Padding', firstConvLayer.PaddingSize, ...
-        'Stride', firstConvLayer.Stride, ...
-        'BiasLearnRateFactor', firstConvLayer.BiasLearnRateFactor, ...
-        'WeightLearnRateFactor', firstConvLayer.WeightLearnRateFactor);
-    newConvLayer.Weights = newWeights;
-    newConvLayer.Bias = firstConvLayer.Bias;
-    lgraph = replaceLayer(lgraph, firstConvLayer.Name, newConvLayer);
-    % --- End Grayscale Modification ---
-
-    % Remove classification layers
-    lgraph = removeLayers(lgraph, {'efficientnet-b0|model|head|dense|MatMul', 'Softmax', 'classification'});
-    
-    % Find the last layer name after removals (likely the pooling or dropout before FC)
-    lastBackboneLayerName = lgraph.Layers(end).Name; 
-    
-    % Define feature dimension from EfficientNet-B0 output
-    featureDim = 1280; % EfficientNet-B0 output features before classifier
-
-    % Add Flatten layer if the output is not already flat
-    % Check the output size of the lastBackboneLayerName if necessary
-    % Assuming the output is [1, 1, featureDim, BatchSize] after global pooling
-    lgraph = addLayers(lgraph, flattenLayer('Name', 'Flatten'));
-    lgraph = connectLayers(lgraph, lastBackboneLayerName, 'Flatten');
-    lastProcessedLayerName = 'Flatten'; % Keep track of the last layer
-
-    % --- Transformer Block ---
-    numHeads = 8; % Number of attention heads
-    headDim = featureDim / numHeads;
-    if mod(featureDim, numHeads) ~= 0
-        error('featureDim must be divisible by numHeads');
-    end
-
-    % Input Layer Normalization (optional but common)
-    lgraph = addLayers(lgraph, layerNormalizationLayer('Name', 'TransformerInputNorm'));
-    lgraph = connectLayers(lgraph, lastProcessedLayerName, 'TransformerInputNorm');
-    transformerInputName = 'TransformerInputNorm';
-
-    % Multi-Head Self-Attention Simulation
-    % 1. QKV Projections
-    lgraph = addLayers(lgraph, fullyConnectedLayer(featureDim, 'Name', 'fc_q'));
-    lgraph = addLayers(lgraph, fullyConnectedLayer(featureDim, 'Name', 'fc_k'));
-    lgraph = addLayers(lgraph, fullyConnectedLayer(featureDim, 'Name', 'fc_v'));
-    lgraph = connectLayers(lgraph, transformerInputName, 'fc_q');
-    lgraph = connectLayers(lgraph, transformerInputName, 'fc_k');
-    lgraph = connectLayers(lgraph, transformerInputName, 'fc_v');
-
-    % 2. Reshape for Multi-Head and Attention Calculation (using functionLayer)
-    lgraph = addLayers(lgraph, functionLayer(@multiHeadAttentionFunc, ...
-        'Name', 'MultiHeadAttention', ...
-        'NumInputs', 3, ... % Q, K, V
-        'OutputNames', {'attended_features'}, ...
-        'Formattable', true, ... % Indicate support for dlarray formats
-        'Acceleratable', true)); % Enable acceleration if possible
-        
-    % Connect Q, K, V to the function layer
-    lgraph = connectLayers(lgraph, 'fc_q', 'MultiHeadAttention/in1');
-    lgraph = connectLayers(lgraph, 'fc_k', 'MultiHeadAttention/in2');
-    lgraph = connectLayers(lgraph, 'fc_v', 'MultiHeadAttention/in3');
-
-    % 3. Output Projection
-    lgraph = addLayers(lgraph, fullyConnectedLayer(featureDim, 'Name', 'AttentionOut'));
-    lgraph = connectLayers(lgraph, 'MultiHeadAttention/attended_features', 'AttentionOut');
-    
-    % 4. Add & Norm (Skip Connection 1)
-    lgraph = addLayers(lgraph, additionLayer(2, 'Name', 'SkipConnection1'));
-    lgraph = addLayers(lgraph, layerNormalizationLayer('Name', 'AttentionNorm'));
-    lgraph = connectLayers(lgraph, 'AttentionOut', 'SkipConnection1/in1');
-    lgraph = connectLayers(lgraph, transformerInputName, 'SkipConnection1/in2'); % Connect back to input of attention block
-    lgraph = connectLayers(lgraph, 'SkipConnection1', 'AttentionNorm');
-    
-    % Feed-Forward Network (FFN)
-    ffnInputName = 'AttentionNorm';
-    lgraph = addLayers(lgraph, fullyConnectedLayer(featureDim * 4, 'Name', 'FFN1'));
-    lgraph = addLayers(lgraph, functionLayer(@geluFunc, 'Name', 'GELU', 'Formattable', true, 'Acceleratable', true)); % Use functionLayer for GELU
-    lgraph = addLayers(lgraph, dropoutLayer(0.1, 'Name', 'FFNDropout'));
-    lgraph = addLayers(lgraph, fullyConnectedLayer(featureDim, 'Name', 'FFN2'));
-    lgraph = connectLayers(lgraph, ffnInputName, 'FFN1');
-    lgraph = connectLayers(lgraph, 'FFN1', 'GELU');
-    lgraph = connectLayers(lgraph, 'GELU', 'FFNDropout');
-    lgraph = connectLayers(lgraph, 'FFNDropout', 'FFN2');
-
-    % Add & Norm (Skip Connection 2)
-    lgraph = addLayers(lgraph, additionLayer(2, 'Name', 'SkipConnection2'));
-    lgraph = addLayers(lgraph, layerNormalizationLayer('Name', 'FFNNorm'));
-    lgraph = connectLayers(lgraph, 'FFN2', 'SkipConnection2/in1');
-    lgraph = connectLayers(lgraph, ffnInputName, 'SkipConnection2/in2'); % Connect back to input of FFN block
-    lgraph = connectLayers(lgraph, 'SkipConnection2', 'FFNNorm');
-    
-    lastProcessedLayerName = 'FFNNorm'; % Output of the transformer block
-    % --- End Transformer Block ---
-
-    % --- Decoder Heads ---
-    % Amplitude branch
-    lgraph = addLayers(lgraph, [
-        fullyConnectedLayer(512, 'Name', 'AmpFC1')
-        layerNormalizationLayer('Name', 'AmpNorm1') % Use LayerNorm instead of BatchNorm after Transformer
-        reluLayer('Name', 'AmpReLU1')
-        dropoutLayer(0.3, 'Name', 'AmpDrop1')
-        fullyConnectedLayer(256, 'Name', 'AmpFC2')
-        layerNormalizationLayer('Name', 'AmpNorm2')
-        reluLayer('Name', 'AmpReLU2')
-        dropoutLayer(0.2, 'Name', 'AmpDrop2')
-        fullyConnectedLayer(numModes, 'Name', 'AmpOut')
-        functionLayer(@normalizeAmplitudesFunc, 'Name', 'AmpNorm', 'Formattable', true, 'Acceleratable', true)
-    ]);
-    lgraph = connectLayers(lgraph, lastProcessedLayerName, 'AmpFC1'); % Connect from transformer output
-
-    % Phase branch
-    lgraph = addLayers(lgraph, [
-        fullyConnectedLayer(512, 'Name', 'PhaseFC1')
-        layerNormalizationLayer('Name', 'PhaseNorm1') % Use LayerNorm
-        reluLayer('Name', 'PhaseReLU1')
-        dropoutLayer(0.3, 'Name', 'PhaseDrop1')
-        fullyConnectedLayer(256, 'Name', 'PhaseFC2')
-        layerNormalizationLayer('Name', 'PhaseNorm2')
-        reluLayer('Name', 'PhaseReLU2')
-        dropoutLayer(0.2, 'Name', 'PhaseDrop2')
-        fullyConnectedLayer(numModes - 1, 'Name', 'PhaseOut') % numModes-1 phases
-        sigmoidLayer('Name', 'PhaseSigmoid')
-    ]);
-    lgraph = connectLayers(lgraph, lastProcessedLayerName, 'PhaseFC1'); % Connect from transformer output
-    % --- End Decoder Heads ---
-
-    % Concatenate outputs
-    lgraph = addLayers(lgraph, depthConcatenationLayer(2, 'Name', 'OutputConcat')); % Use depth concatenation
-    lgraph = connectLayers(lgraph, 'AmpNorm', 'OutputConcat/in1');
-    lgraph = connectLayers(lgraph, 'PhaseSigmoid', 'OutputConcat/in2');
-    
-    % Create final network
-    dlnet = dlnetwork(lgraph);
-    disp('Custom model created successfully.');
-end
-
-% --- Helper Functions for functionLayer ---
-
-function Z = multiHeadAttentionFunc(Q, K, V)
-    % Simple self-attention without explicit multi-head implementation
-    % Get dimensions
-    featureDim = size(Q, 1);
-    batchSize = size(Q, 2);
-    
-    % Compute attention scores for each batch element
-    scores = zeros(1, batchSize, 'like', Q);
-    for b = 1:batchSize
-        % Simple dot product attention
-        qk = sum(Q(:, b) .* K(:, b));
-        scores(1, b) = qk / sqrt(featureDim);
-    end
-    
-    % Apply attention weights
-    Z = zeros(featureDim, batchSize, 'like', V);
-    for b = 1:batchSize
-        Z(:, b) = V(:, b) * scores(1, b);
-    end
-    
-    % Ensure correct format
-    Z = dlarray(Z, 'CB');
-end
-
-
-function Y = geluFunc(X)
-    % GELU activation function for dlarray
-    % GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    coeff = sqrt(2/pi);
-    Y = 0.5 * X .* (1 + tanh(coeff * (X + 0.044715 * X.^3)));
-end
-
-function Y = normalizeAmplitudesFunc(X)
-    % Ensure amplitudes are positive and normalized with L2 norm along channel dim
-    % Assumes input X has format 'CB' or 'BC'
-    channelDim = find(dims(X) == 'C');
-    if isempty(channelDim)
-         channelDim = ndims(X); % Assume last dimension if 'C' is not present
-    end
-
-    X_pos = max(X, 0); % Ensure positive
-    normFactor = sqrt(sum(X_pos.^2, channelDim) + 1e-8);
-    Y = X_pos ./ normFactor;
-end
-
-function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = modelGradients_abs(dlnet, dlX, dlY, useReconLoss, adaptiveLossWeights)
+function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = modelGradients_abs(dlnet, dlX, dlY, P, useReconLoss, adaptiveLossWeights, utils)
     % Persistent variables for Dynamic Loss Normalization using EMA
     persistent loss_ema weights_initialized iteration_count loss_names_internal num_tasks_internal;
 
@@ -943,30 +548,22 @@ function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = 
     amps_true = dlY(1:number_of_modes, :);
     phase_true = dlY(number_of_modes + 1:end, :); % Ground truth normalized to [-1,1] (assuming canonical)
 
-    % Convert predicted phases to [-1, 1] to match canonical true phases
-    % phase_pred = (phase_pred - 0.5) * 2;
-
     % --- Calculate Individual Task Losses ---
-    % 1. Amplitude Loss (L2 Fidelity) - Keep diversity separate if needed
+    % 1. Amplitude Loss (L2 Fidelity)
     ampLoss = l2loss(amps_raw, amps_true);
-    %ampLoss = dlarray(zeros(1, 'like', amps_raw), 'CB'); % Initialize to zero
     
     % 2. Phase Loss - both magnitude and direction
     % Use combined L2 loss on the full phase values instead of just magnitude
     phaseLoss = l2loss(abs(phase_pred), abs(phase_true));
-    %phaseLoss = zeros(1, 'like', ampLoss); % Initialize to zero
     
-    % 3. Phase Sign Loss (Using BCE for stronger gradients on sign prediction)
-    %signLoss = calculatePhaseSignLoss(phase_pred, phase_true);
-    %signLoss = l2loss(phase_pred, phase_true); % Using L2 loss for simplicity
-    signLoss = zeros(1, 'like', phaseLoss); % Initialize to zero
+    % 3. Phase Sign Loss placeholder
+    signLoss = zeros(1, 'like', phaseLoss);
     
     % Store current losses
     current_losses = [ampLoss, phaseLoss];
 
     % 4. Reconstruction Loss (if enabled)
     reconLoss = ones(1, 'like', ampLoss); % Initialize
-    linear_recon = []; % Initialize for scope check later
     if useReconLoss
         % Create complex weights using predicted amplitudes and phases
         weights_pred = dlarray(zeros(number_of_modes, size(amps_raw, 2), 'like', amps_raw), 'CB');
@@ -980,13 +577,12 @@ function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = 
             weights_true(m,:) = amps_true(m,:) .* exp(1i * (phase_true(m-1,:) * pi));
         end
 
-        % Build linear image
-        [linear_recon, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), weights_pred, false);
-        [dlX_linear, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), weights_true, false);
+        % Build linear image using precomputed P
+        [linear_recon, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), weights_pred', false, 0, P);
+        [dlX_linear, ~] = mmf_build_image(number_of_modes, size(dlX, 1), size(dlX, 4), weights_true', false, 0, P);
 
-        % Correlation-based loss
-        reconLoss = 1 - dlCorr(dlX_linear, linear_recon);
-        % --- End Reconstruction Loss ---
+        % Correlation-based loss using utility function
+        reconLoss = 1 - utils.dlCorr(dlX_linear, linear_recon);
 
         current_losses = [current_losses, reconLoss]; % Add recon loss to the list
     end
@@ -1036,8 +632,7 @@ function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = 
             fprintf('  Total Loss = %.4f\n', extractdata(gather(loss)));
         end
     else
-        % Simple equal weighting - just average the losses
-        % You can also use fixed weights if certain tasks need more emphasis
+        % Simple weighted average with fixed weights
         amp_weight = 200.0;
         phase_weight = 1.0;
         sign_weight = 1.0;
@@ -1065,94 +660,7 @@ function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = 
     gradients = dlgradient(loss, dlnet.Learnables);
 end
 
-function signLoss = calculatePhaseSignLoss(phase_pred, phase_true)
-    % Multi-component loss with strong gradient for canonical representation
-    
-    % 1. Binary Cross-Entropy with balanced weighting
-    epsilon = 1e-8;
-    pred_prob = (tanh(5 * phase_pred) + 1) / 2;  % Steeper tanh for sharper decision boundary
-    true_prob = (tanh(5 * phase_true) + 1) / 2;
-    
-    % Count positive/negative examples for balance weighting
-    pos_weight = sum(true_prob < 0.5, 'all') / numel(true_prob);
-    neg_weight = 1 - pos_weight;
-    
-    % Weighted BCE with stronger penalty for sign flips
-    bce_loss = -(pos_weight .* true_prob .* log(pred_prob + epsilon) + ...
-                 neg_weight .* (1 - true_prob) .* log(1 - pred_prob + epsilon));
-    bce_component = mean(bce_loss, 'all');
-    
-    % 2. Cosine similarity on signs
-    sign_pred = sign(phase_pred);
-    sign_true = sign(phase_true);
-    sign_match_loss = 1 - mean(sign_pred .* sign_true, 'all');
-    
-    % 3. Phase-aware margin loss (larger penalty for phase values near zero)
-    certainty_factor = 1 - exp(-5 * abs(phase_true)); % Higher weight for confident true phases
-    margin = 0.8;
-    margin_loss = max(0, margin - phase_pred .* sign_true) .* certainty_factor;
-    margin_component = mean(margin_loss, 'all');
-    
-    % 4. NEW: Mode relationship consistency loss
-    mode_relationship_loss = 0;
-    num_phases = size(phase_pred, 1);
-    
-    if num_phases > 1
-        for i = 1:num_phases-1
-            for j = i+1:num_phases
-                % True relationship between modes i and j
-                true_relationship = sign_true(i,:) .* sign_true(j,:);
-                
-                % Predicted relationship between modes i and j
-                pred_relationship = sign_pred(i,:) .* sign_pred(j,:);
-                
-                % Penalize inconsistent relationships
-                mode_relationship_loss = mode_relationship_loss + ...
-                    mean((true_relationship - pred_relationship).^2, 'all');
-            end
-        end
-        mode_relationship_loss = mode_relationship_loss / (num_phases * (num_phases-1) / 2);
-    end
-    
-    % Weighted sum of all components
-    signLoss = 0.35 * bce_component + ...
-               0.25 * sign_match_loss + ...
-               0.20 * margin_component + ...
-               0.20 * mode_relationship_loss;
-end
-
-function corr = dlCorr(A, B)
-    % Reshape to 2D while maintaining dlarray format
-    imgSize = size(A, 1) * size(A, 2);
-    batchSize = size(A, 4);
-    
-    % Reshape to [pixels, batch] - crucial to keep as dlarray
-    A_flat = reshape(A, [imgSize, batchSize]);
-    B_flat = reshape(B, [imgSize, batchSize]);
-    
-    % Fast mean calculation along pixel dimension
-    A_mean = mean(A_flat, 1);  
-    B_mean = mean(B_flat, 1);
-    
-    % Center the data (subtract mean)
-    A_centered = A_flat - A_mean;
-    B_centered = B_flat - B_mean;
-    
-    % Compute correlation efficiently
-    % Numerator: covariance
-    numerator = sum(A_centered .* B_centered, 1);
-    
-    % Denominator: product of standard deviations
-    A_std = sqrt(sum(A_centered.^2, 1) + 1e-8);  % Add epsilon for numerical stability
-    B_std = sqrt(sum(B_centered.^2, 1) + 1e-8);
-    denominator = A_std .* B_std;
-    
-    % Compute correlation and average across batch
-    batch_corr = numerator ./ denominator;
-    corr = mean(batch_corr);
-end
-
-function [totalLoss, ampLoss, phaseLoss] = modelValidation_abs(dlnet, X, Y, batchSize, executionEnvironment, useReconLoss, adaptiveLossWeights)
+function [totalLoss, ampLoss, phaseLoss] = modelValidation_abs(dlnet, X, Y, P, batchSize, executionEnvironment, useReconLoss, adaptiveLossWeights, utils)
     numValidation = size(X, 4);
     totalLoss = 0;
     ampLoss = 0;
@@ -1168,7 +676,7 @@ function [totalLoss, ampLoss, phaseLoss] = modelValidation_abs(dlnet, X, Y, batc
             dlY = gpuArray(dlY);
         end
 
-        [~, batchLoss, batchAmpLoss, batchPhaseLoss, ~, ~, ~] = dlfeval(@modelGradients_abs, dlnet, dlX, dlY, useReconLoss, adaptiveLossWeights);
+        [~, batchLoss, batchAmpLoss, batchPhaseLoss, ~, ~, ~] = dlfeval(@modelGradients_abs, dlnet, dlX, dlY, P, useReconLoss, adaptiveLossWeights, utils);
         totalLoss = totalLoss + extractdata(batchLoss);
         ampLoss = ampLoss + extractdata(batchAmpLoss);
         phaseLoss = phaseLoss + extractdata(batchPhaseLoss);
