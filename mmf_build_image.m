@@ -116,7 +116,11 @@ function [Image_data, complex_field_out] = mmf_build_image(number_of_modes, imag
                     Eout = Eout_sim;
                 end
             else
-                Eout = U_initial_raw;
+                if size(U_initial_raw, 1) ~= image_size || size(U_initial_raw, 2) ~= image_size
+                    Eout = imresize(U_initial_raw, [image_size, image_size], 'bicubic');
+                else
+                    Eout = U_initial_raw;
+                end              
             end
             intensity = abs(Eout).^2;
             max_val = max(intensity(:));
