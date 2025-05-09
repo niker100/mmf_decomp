@@ -26,7 +26,7 @@ else
 end
 
 % Improved parameter settings
-base_samples = 10000;  % Base number of unique amplitude/phase combinations
+base_samples = 1000;  % Base number of unique amplitude/phase combinations
 
 % Dynamic number of variants based on mode count
 if generate_all_signs
@@ -35,7 +35,7 @@ if generate_all_signs
     num_variants = 2^(number_of_modes-1);
 else
     % For larger mode counts, use a fixed number of variants
-    num_variants = 8;  % Increased from 4 to 8 sign variants
+    num_variants = 1;  % Increased from 4 to 8 sign variants
 end
 
 image_size = 64;      % Increased resolution for better visualization
@@ -44,31 +44,12 @@ total_samples = base_samples * num_variants;
 % Non-linearity strength parameters
 useNonLinear = true;
 use_varying_nl = true;  % Use varying non-linearity strength
-nl_strength_min = 1e0;  % Minimum non-linearity strength
-nl_strength_max = 1e0;  % Maximum non-linearity strength
+nl_strength_min = 20;  % Minimum non-linearity strength
+nl_strength_max = 20;  % Maximum non-linearity strength
 batch_size = 512;       % Increased batch size for efficiency
 
 %% Precompute BPMmatlab model and modes ONCE for all samples
-P = BPMmatlab.model;
-P.name = 'batch_dataset_gen';
-P.useAllCPUs = true;
-P.useGPU = true;
-P.Lx_main = 50e-6;
-P.Ly_main = 50e-6;
-P.Nx_main = image_size;
-P.Ny_main = image_size;
-P.padfactor = 1.5;
-P.dz_target = 1e-6;
-P.lambda = 1000e-9;
-P.n_background = 1.45;
-P.n_0 = 1.46;
-P.Lz = 10e-4;
-P.updates = 1;
-core_radius = 25e-6;
-n_core = P.n_0;
-n_clad = P.n_background;
-P = initializeRIfromFunction(P, @(X,Y,~,~) n_clad + (n_core-n_clad)*(X.^2+Y.^2 < core_radius^2));
-P = findModes(P, number_of_modes, 'plotModes', true);
+P = mmf_utils().getOrCreateModelWithModes(number_of_modes, image_size, true);
 
 %% Generation of complex mode weights and label vector
 
@@ -307,7 +288,7 @@ num_expanded_variants = num_variants;  % Set to 32 sign variants
 % Create expanded sign patterns (first mode always positive as reference)
 expanded_phase_signs = cell(num_expanded_variants, 1);
 
-if number_of_modes > 6
+if number_of_modes > 10
     % For larger mode counts, create systematic and random patterns
     
     % 1-8: Keep original patterns
