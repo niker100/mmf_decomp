@@ -261,8 +261,12 @@ function [metrics, reconstructions] = evaluatePipeline(X_test, amps_true, phases
     
     % Create complex weights from final predictions
     final_phases_pred = phase_mags_pred .* final_signs_pred;
-    weights_pred = utils.createComplexWeights(amps_pred, final_phases_pred);
-    weights_true = utils.createComplexWeights(amps_true, phases_true);
+    size(amps_pred)
+    size(final_phases_pred)
+    size(amps_true)
+    size(phases_true)
+    weights_pred = utils.createComplexWeights(amps_pred', final_phases_pred');
+    weights_true = utils.createComplexWeights(amps_true', phases_true');
     
     % Create ground truth reconstructions once
     image_size = size(X_test, 1);
@@ -274,10 +278,11 @@ function [metrics, reconstructions] = evaluatePipeline(X_test, amps_true, phases
         endIdx = min(i*batchSize, numSamples);
         
         % Extract batch weights
-        batch_weights_true = weights_true(startIdx:endIdx, :);
+        batch_weights_true = weights_true(:, startIdx:endIdx);
+        size(batch_weights_true)
         
         % Build reconstruction
-        [recon_true_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights_true, false, 0, P);
+        [recon_true_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights_true', false, 0, P);
         
         % Store reconstructions
         recons_true(:,:,:,startIdx:endIdx) = recon_true_batch;
@@ -292,10 +297,10 @@ function [metrics, reconstructions] = evaluatePipeline(X_test, amps_true, phases
         endIdx = min(i*batchSize, numSamples);
         
         % Extract batch weights
-        batch_weights_pred = weights_pred(startIdx:endIdx, :);
+        batch_weights_pred = weights_pred(:, startIdx:endIdx);
         
         % Build reconstruction
-        [recon_pred_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights_pred, false, 0, P);
+        [recon_pred_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights_pred', false, 0, P);
         
         % Store reconstructions
         recons_pred(:,:,:,startIdx:endIdx) = recon_pred_batch;
@@ -357,7 +362,9 @@ function residuals = generateResiduals(X, amps_pred, phase_mags_pred, phase_sign
     
     % Create complex weights
     phases_pred = phase_mags_pred .* phase_signs_pred;
-    weights_pred = utils.createComplexWeights(amps_pred, phases_pred);
+    size(amps_pred)
+    size(phases_pred)
+    weights_pred = utils.createComplexWeights(amps_pred', phases_pred');
     
     % Generate reconstructions in batches
     numBatches = ceil(numSamples/batchSize);
@@ -367,10 +374,11 @@ function residuals = generateResiduals(X, amps_pred, phase_mags_pred, phase_sign
         endIdx = min(i*batchSize, numSamples);
         
         % Extract batch weights
-        batch_weights = weights_pred(startIdx:endIdx, :);
+        batch_weights = weights_pred(:, startIdx:endIdx);
+        size(batch_weights)
         
         % Build reconstruction
-        [recon_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights, false, 0, P);
+        [recon_batch, ~] = mmf_build_image(number_of_modes, image_size, length(startIdx:endIdx), batch_weights', false, 0, P);
         
         % Calculate residuals
         residuals(:,:,:,startIdx:endIdx) = X(:,:,:,startIdx:endIdx) - recon_batch;

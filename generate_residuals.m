@@ -26,7 +26,7 @@ function generate_residuals(mmf_train, labels_train, mmf_val, labels_val, mmf_te
     clear ampModel;
 
     phaseModel = load('phase_sign_model.mat');
-    dlnet_phase = phaseModel.dlnet_phase;
+    dlnet_phase = phaseModel.dlnet;
     clear phaseModel;
 
     % Get or create BPMmatlab model with precomputed modes
@@ -176,7 +176,7 @@ function residuals = compute_residuals(X, ampNet, phaseNet, number_of_modes, P, 
             mb_weights = weights_pred(:, mb_indices);
             
             % Build reconstruction using precomputed P
-            [recon_mb, ~] = mmf_build_image(number_of_modes, image_size, length(mb_indices), mb_weights, false, 0, P);
+            [recon_mb, ~] = mmf_build_image(number_of_modes, image_size, length(mb_indices), mb_weights', false, 0, P);
             
             % Get corresponding nonlinear images
             nonlinear_mb = X(:,:,:,mb_global_indices);
