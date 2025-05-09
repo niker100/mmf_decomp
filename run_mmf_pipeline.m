@@ -155,6 +155,8 @@ else
 end
 
 trainingOptions.modelType = 'PhaseSignResNet'; % Change model type for phase sign model
+trainingOptions.correlationWeight = 0.2;
+trainingOptions.signLossWeight = 0.8;
 
 %% Step 2: Train Phase Sign Model
 if options.trainPhaseModel
