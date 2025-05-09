@@ -12,6 +12,8 @@
 *.autosave
 .DS_Store
 Thumbs.db
+*.png
+*.jpg
 
 # Compiled MEX files
 *.mex*
