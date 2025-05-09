@@ -47,6 +47,51 @@ catch ME
     error('Failed to load dataset: %s', ME.message);
 end
 
+%% Step 0: Canonicalize Phase Values
+% Ensure first phase value is always positive to eliminate sign ambiguity
+fprintf('\n=== Step 0: Canonicalizing phase values ===\n');
+
+% Extract phase portions from labels
+train_phases = labels_train(:, number_of_modes+1:end);
+val_phases = labels_val(:, number_of_modes+1:end);
+test_phases = labels_test(:, number_of_modes+1:end);
+
+% Get first phase sign for each sample (reference phase)
+train_first_phase_signs = sign(train_phases(:,1));
+val_first_phase_signs = sign(val_phases(:,1));
+test_first_phase_signs = sign(test_phases(:,1));
+
+% Count samples with negative first phase
+num_train_flipped = sum(train_first_phase_signs < 0);
+num_val_flipped = sum(val_first_phase_signs < 0);
+num_test_flipped = sum(test_first_phase_signs < 0);
+
+fprintf('Found %d/%d training samples with negative first phase\n', num_train_flipped, size(train_phases,1));
+fprintf('Found %d/%d validation samples with negative first phase\n', num_val_flipped, size(val_phases,1));
+fprintf('Found %d/%d test samples with negative first phase\n', num_test_flipped, size(test_phases,1));
+
+% Apply canonicalization: multiply all phases by the sign of the first phase
+% This ensures the first phase is always positive
+for i = 1:size(train_phases, 1)
+    if train_first_phase_signs(i) < 0
+        labels_train(i, number_of_modes+1:end) = -train_phases(i,:);
+    end
+end
+
+for i = 1:size(val_phases, 1)
+    if val_first_phase_signs(i) < 0
+        labels_val(i, number_of_modes+1:end) = -val_phases(i,:);
+    end
+end
+
+for i = 1:size(test_phases, 1)
+    if test_first_phase_signs(i) < 0
+        labels_test(i, number_of_modes+1:end) = -test_phases(i,:);
+    end
+end
+
+fprintf('Phase canonicalization complete. All samples now have positive first phase.\n');
+
 %% Validate Data Format
 % Check dimensions of training data
 if ndims(mmf_train) ~= 4 || size(mmf_train, 3) ~= 1
@@ -92,26 +137,24 @@ trainingOptions.executionEnvironment = options.executionEnvironment;
 trainingOptions.plotProgress = options.plotProgress;
 trainingOptions.validationFrequency = options.validationFrequency;
 trainingOptions.validationPatience = options.validationPatience;
+trainingOptions.modelType = 'MLP';
+trainingOptions.adaptiveLossWeights = false;
 
 %% Step 1: Train Amplitude and Phase Magnitude Model
 if options.trainAmpModel
     fprintf('\n=== Step 1: Training amplitude and phase magnitude model ===\n');
     
-    % Extract training labels
-    YTrain_amps = labels_train(:, 1:number_of_modes);
-    YTrain_phases = labels_train(:, number_of_modes+1:end);
-    YVal_amps = labels_val(:, 1:number_of_modes);
-    YVal_phases = labels_val(:, number_of_modes+1:end);
-    
     % Train the model with precomputed modes
-    train_absolute_model(mmf_train, YTrain_amps, YTrain_phases, ...
-                         mmf_val, YVal_amps, YVal_phases, ...
+    train_absolute_model(mmf_train, labels_train, ...
+                         mmf_val, labels_val, ...
                          trainingOptions, P);
     
     fprintf('Amplitude and phase magnitude model training completed\n');
 else
     fprintf('\n=== Step 1: Skipping amplitude and phase magnitude model training ===\n');
 end
+
+trainingOptions.modelType = 'PhaseSignResNet'; % Change model type for phase sign model
 
 %% Step 2: Train Phase Sign Model
 if options.trainPhaseModel

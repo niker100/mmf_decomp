@@ -44,7 +44,7 @@ function train_phase_sign_classifier(mmf_train, labels_train, mmf_val, labels_va
     
     % Load pre-trained model
     modelData = load('phase_sign_model.mat');   
-    dlnet = modelData.dlnet_phase;
+    dlnet = modelData.dlnet;
     number_of_modes = modelData.number_of_modes;
     clear modelData; % Free memory
     
@@ -119,7 +119,7 @@ function predictions = predictInBatches(net, data, options, utils)
     if canUseGPU
         dlX_sample = gpuArray(dlX_sample);
     end
-    outputSize = size(predict(net, dlX_sample), 2);
+    outputSize = size(predict(net, dlX_sample), 1);
     predictions = zeros(numSamples, outputSize);
     
     for i = 1:ceil(numSamples/batchSize)
@@ -135,7 +135,7 @@ function predictions = predictInBatches(net, data, options, utils)
         
         % Get predictions and move back to CPU
         batchPred = predict(net, dlX);
-        predictions(startIdx:endIdx, :) = extractdata(batchPred)';
+        predictions(startIdx:endIdx, :) = extract(batchPred)';
     end
 end
 
@@ -250,7 +250,7 @@ function classifier = trainGlobalSignClassifier(X_train, y_train, X_val, y_val, 
             
             % Log progress
             if strcmpi(options.plotProgress, "gui")
-                recordMetrics(monitor, iteration, Loss=extractdata(loss), Accuracy=extractdata(accuracy));
+                recordMetrics(monitor, iteration, Loss=extract(loss), Accuracy=extract(accuracy));
                 updateInfo(monitor, Epoch=epoch, LearningRate=options.initialLearnRate);
                 
                 % Check for stop button
@@ -266,7 +266,7 @@ function classifier = trainGlobalSignClassifier(X_train, y_train, X_val, y_val, 
                 
                 % Log validation metrics
                 if strcmpi(options.plotProgress, "gui")
-                    recordMetrics(monitor, iteration, ValidationLoss=extractdata(valLoss), ValidationAccuracy=extractdata(valAccuracy));
+                    recordMetrics(monitor, iteration, ValidationLoss=extract(valLoss), ValidationAccuracy=extract(valAccuracy));
                 end
                 
                 % Early stopping check - save best model based on validation accuracy
@@ -468,13 +468,13 @@ function [valLoss, valAccuracy] = validateGlobalSignClassifier(net, X_val, Y_val
         
         % Loss - binary cross-entropy
         batchLoss = -mean(dlY_batch.*log(Y_pred + 1e-8) + (1-dlY_batch).*log(1-Y_pred + 1e-8), 'all');
-        totalLoss = totalLoss + extractdata(batchLoss) * size(X_batch, 4);
+        totalLoss = totalLoss + extract(batchLoss) * size(X_batch, 4);
         
         % Accuracy
         Y_binary = Y_pred > 0.5;
         Y_true = dlY_batch > 0.5;
         batchCorrect = sum(Y_binary == Y_true, 'all');
-        correctPredictions = correctPredictions + extractdata(batchCorrect);
+        correctPredictions = correctPredictions + extract(batchCorrect);
         totalPredictions = totalPredictions + numel(Y_binary);
     end
     
@@ -514,14 +514,14 @@ function evaluateGlobalSignClassifier(classifier, X_test, global_test_labels, te
         
         % Get predictions and probabilities
         pred_probs = predict(classifier, dlX_batch);
-        all_probabilities(startIdx:endIdx) = extractdata(pred_probs);
-        all_predictions(startIdx:endIdx) = extractdata(pred_probs > 0.5);
+        all_probabilities(startIdx:endIdx) = extract(pred_probs);
+        all_predictions(startIdx:endIdx) = extract(pred_probs > 0.5);
     end
     
     % Convert to standard arrays
-    test_signs_pred = extractdata(test_signs_pred);
-    test_signs_true = extractdata(test_signs_true);
-    all_predictions = extractdata(all_predictions);
+    test_signs_pred = extract(test_signs_pred);
+    test_signs_true = extract(test_signs_true);
+    all_predictions = extract(all_predictions);
     
     % Ensure global_test_labels is a row vector for comparison
     global_test_labels = global_test_labels(:)';

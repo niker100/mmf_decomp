@@ -435,13 +435,13 @@ function dlnet = createCNNModel(inputSize, outputSize)
     % Shared feature extraction
     layers = [
         imageInputLayer([inputSize 1], 'Name', 'input', 'Normalization', 'none')
-        convolution2dLayer(3, 64, 'Padding', 'same', 'Name', 'conv1')
+        convolution2dLayer(9, 64, 'Padding', 'same', 'Name', 'conv1')
         leakyReluLayer(0.2, 'Name', 'relu1')
         maxPooling2dLayer(2, 'Stride', 2, 'Name', 'pool1')
-        convolution2dLayer(3, 128, 'Padding', 'same', 'Name', 'conv2')
+        convolution2dLayer(7, 128, 'Padding', 'same', 'Name', 'conv2')
         reluLayer('Name', 'relu2')
         maxPooling2dLayer(2, 'Stride', 2, 'Name', 'pool2')
-        convolution2dLayer(3, 256, 'Padding', 'same', 'Name', 'conv3')
+        convolution2dLayer(5, 256, 'Padding', 'same', 'Name', 'conv3')
         leakyReluLayer(0.2, 'Name', 'relu3')
         maxPooling2dLayer(2, 'Stride', 2, 'Name', 'pool3')
         convolution2dLayer(3, 512, 'Padding', 'same', 'Name', 'conv4')
@@ -633,7 +633,7 @@ function [gradients, loss, ampLoss, phaseLoss, reconLoss, normLoss, signLoss] = 
         end
     else
         % Simple weighted average with fixed weights
-        amp_weight = 200.0;
+        amp_weight = 50.0;
         phase_weight = 1.0;
         sign_weight = 1.0;
         recon_weight = 1.0;
