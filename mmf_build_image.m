@@ -40,7 +40,7 @@ function [Image_data, complex_field_out] = mmf_build_image(number_of_modes, imag
     params = struct();
     params.T0 = 50;
     params.lam0 = P.lambda * 1e9;
-    params.distance = 10; % Default, can be changed per sample if needed
+    params.distance = 100; % Default, can be changed per sample if needed
     params.N = nonlinear_strength;
     params.sbeta2 = -0.1;
     params.nt = image_size;
@@ -73,18 +73,17 @@ function [Image_data, complex_field_out] = mmf_build_image(number_of_modes, imag
             U_initial = gpuArray(U_initial);
         end
 
-        % Set N for linear/nonlinear
+        % linear/nonlinear
         if useNonLinear
             params.N = nonlinear_strength;
+            % Propagate
+            [U_out, ~, ~] = gnlse_propagate(U_initial, params);
+            if useGPU
+                U_out = gather(U_out);
+            end
         else
-            params.N = 0.0;
-        end
-
-        % Propagate
-        [U_out, ~, ~] = gnlse_propagate(U_initial, params);
-        if useGPU
-            U_out = gather(U_out);
-        end
+            U_out = U_initial;
+        end        
 
         % Normalize intensity for output
         intensity = abs(U_out).^2;
