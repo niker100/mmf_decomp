@@ -14,6 +14,23 @@
 Thumbs.db
 *.png
 *.jpg
+*.jpeg
+*.tiff
+*.gif
+*.pdf
+*.eps
+*.svg
+*.csv
+*.txt
+*.xlsx
+*.xls
+*.json
+*.xml
+*.html
+*.zip
+*.tar
+*.gz
+*.tgz
 
 # Compiled MEX files
 *.mex*
