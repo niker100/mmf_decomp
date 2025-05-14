@@ -74,7 +74,7 @@ disp('Setting up multimode fiber parameters...');
 
 % Core parameters
 lambda0 = 1030e-9;          % Center wavelength [m]
-fiber_length = 1;           % Propagation distance [m]
+fiber_length = 10;           % Propagation distance [m]
 Nx = 800;                   % Grid points for mode profiles
 radius = 25;                % Fiber radius [um]
 num_modes = 4;              % Number of modes
@@ -164,22 +164,22 @@ end
 sgtitle('Fiber Configuration', 'FontSize', 14);
 save_figure(fig, [results_dir '/fiber_setup']);
 
-%% Simulation Base Parameters
+
 sim_base = struct(...
     'f0', 3e8/(lambda0*1e9), ...
-    'deltaZ', 0.005, ...
-    'M', 1, ...
+    'deltaZ', 0.001, ...
+    'M', 10, ... % Parallelization extent for MPA. 1 = no parallelization, 5-20 is recommended; there are strongly diminishing returns after 5-10
     'n_tot_max', 5, ...
     'n_tot_min', 2, ...
     'tol', 1e-6, ...
-    'single_yes', 0, ...
-    'gpu_yes', 0, ...
-    'mpa_yes', 0, ...
+    'single_yes', 1, ...
+    'gpu_yes', 1, ...
+    'mpa_yes', 1, ...
     'SK_factor', 1, ...
     'use_const_mem', 0, ...
     'check_nan', 1, ...
     'verbose', 0, ...
-    'cuda_dir_path', '' ...
+    'cuda_dir_path', 'GMMNLSE-Solver-FINAL/cuda' ...
 );
 
 % For storing all test results
@@ -189,16 +189,17 @@ results = struct();
 disp('Running Test 1: SPM Spectral Broadening...');
 
 % Test configuration
-t_width = 0.05; % Pulse width [ps]
+t_width = 0.1; % Pulse width [ps]
 sim = sim_base;
 sim.fr = 0; sim.sw = 0; % No Raman or self-steepening
 sim.save_period = fiber.L0/100;
+amplitude = 1; % Pulse amplitude
 
 % Initial pulse
 initial_condition = struct();
 initial_condition.dt = dt;
 initial_condition.fields = zeros(Nt, fiber.num_modes);
-initial_condition.fields(:,1) = exp(-t.^2/t_width^2).'; % Single mode excitation
+initial_condition.fields(:,1) = amplitude * exp(-t.^2/t_width^2).'; % Single mode excitation
 
 % Run propagation
 foutput = GMMNLSE_propagate(fiber, initial_condition, sim);
@@ -293,10 +294,10 @@ disp('Running Test 2: Multimode Propagation...');
 initial_condition = struct();
 initial_condition.dt = dt;
 initial_condition.fields = zeros(Nt, fiber.num_modes);
-initial_condition.fields(:,1) = exp(-t.^2/t_width^2).';
-initial_condition.fields(:,2) = 0.8 * exp(-t.^2/t_width^2).' .* exp(1i*pi/2);
-initial_condition.fields(:,3) = 0.6 * exp(-t.^2/t_width^2).' .* exp(1i*pi);
-initial_condition.fields(:,4) = 0.4 * exp(-t.^2/t_width^2).' .* exp(1i*3*pi/2);
+initial_condition.fields(:,1) = amplitude * exp(-t.^2/t_width^2).';
+initial_condition.fields(:,2) = amplitude * 0.8 * exp(-t.^2/t_width^2).' .* exp(1i*pi/2);
+initial_condition.fields(:,3) = amplitude * 0.6 * exp(-t.^2/t_width^2).' .* exp(1i*pi);
+initial_condition.fields(:,4) = amplitude * 0.4 * exp(-t.^2/t_width^2).' .* exp(1i*3*pi/2);
 
 % Enable Raman effect and self-steepening
 sim.fr = 0.18; sim.sw = 1;
@@ -383,7 +384,7 @@ fiber.SR = fiber.SR * 5;
 initial_condition = struct();
 initial_condition.dt = dt;
 initial_condition.fields = zeros(Nt, fiber.num_modes);
-initial_condition.fields(:,1) = exp(-t.^2/t_width^2).';
+initial_condition.fields(:,1) = amplitude * exp(-t.^2/t_width^2).';
 
 % Setup simulation parameters
 sim.fr = 0.18; % Raman fraction
